@@ -14,6 +14,18 @@ const trafficConfigSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'BackendServer',
     default: null
+  },
+  pingIntervalMinutes: {
+    type: Number,
+    default: 5
+  },
+  pingIntervalSeconds: {
+    type: Number,
+    default: 300
+  },
+  requestsPerPing: {
+    type: Number,
+    default: 1
   }
 }, {
   timestamps: true

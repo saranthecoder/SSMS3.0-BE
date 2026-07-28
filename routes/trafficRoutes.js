@@ -69,12 +69,16 @@ router.get('/servers', protect, admin, async (req, res) => {
     const liveStats = req.app.get('liveTrafficStats') || { total: 145, rpm: 22 };
 
     const mappedServers = servers.map(s => {
-      const isOnline = s.status === 'online';
+      const isOnline = s.isActive && s.status === 'online';
       const rpm = isOnline ? (s.url.includes('localhost') || s.isPrimary ? liveStats.rpm : Math.floor(liveStats.rpm * 0.4)) : 0;
       const totalReqs = isOnline ? (s.url.includes('localhost') || s.isPrimary ? liveStats.total : Math.floor(liveStats.total * 0.4)) : 0;
       
       return {
         ...s.toObject(),
+        status: s.isActive ? s.status : 'offline',
+        responseTime: s.isActive ? s.responseTime : 0,
+        cpuUsage: s.isActive ? s.cpuUsage : 0,
+        memoryUsage: s.isActive ? s.memoryUsage : 0,
         requestCount: totalReqs,
         reqPerMin: rpm,
         activeConnections: isOnline ? Math.floor(rpm * 1.5) + 3 : 0
@@ -213,7 +217,14 @@ router.get('/config', protect, admin, async (req, res) => {
   try {
     let config = await TrafficConfig.findOne();
     if (!config) {
-      config = await TrafficConfig.create({ policy: 'failover', cpuThreshold: 80, manualSelectedServerId: null });
+      config = await TrafficConfig.create({
+        policy: 'failover',
+        cpuThreshold: 80,
+        manualSelectedServerId: null,
+        pingIntervalMinutes: 5,
+        pingIntervalSeconds: 300,
+        requestsPerPing: 1
+      });
     }
     res.json(config);
   } catch (error) {
@@ -222,11 +233,11 @@ router.get('/config', protect, admin, async (req, res) => {
 });
 
 // @route   POST /api/traffic/config
-// @desc    Update traffic routing config (policy/cpuThreshold/manual server selection)
+// @desc    Update traffic routing config (policy/cpuThreshold/manual server selection/ping interval/requests count)
 // @access  Private/Admin
 router.post('/config', protect, admin, async (req, res) => {
   try {
-    const { policy, cpuThreshold, manualSelectedServerId } = req.body;
+    const { policy, cpuThreshold, manualSelectedServerId, pingIntervalMinutes, pingIntervalSeconds, requestsPerPing } = req.body;
     let config = await TrafficConfig.findOne();
     if (!config) {
       config = new TrafficConfig();
@@ -236,6 +247,16 @@ router.post('/config', protect, admin, async (req, res) => {
     if (cpuThreshold !== undefined) config.cpuThreshold = Number(cpuThreshold);
     if (manualSelectedServerId !== undefined) {
       config.manualSelectedServerId = manualSelectedServerId;
+    }
+    if (pingIntervalSeconds !== undefined) {
+      config.pingIntervalSeconds = Math.max(5, Number(pingIntervalSeconds));
+      config.pingIntervalMinutes = Math.round(config.pingIntervalSeconds / 60) || 1;
+    } else if (pingIntervalMinutes !== undefined) {
+      config.pingIntervalMinutes = Number(pingIntervalMinutes);
+      config.pingIntervalSeconds = config.pingIntervalMinutes * 60;
+    }
+    if (requestsPerPing !== undefined) {
+      config.requestsPerPing = Math.max(1, Math.min(20, Number(requestsPerPing)));
     }
 
     const updatedConfig = await config.save();
@@ -251,6 +272,8 @@ router.post('/config', protect, admin, async (req, res) => {
 router.post('/ping', protect, admin, async (req, res) => {
   try {
     const servers = await BackendServer.find({ isActive: true });
+    const config = await TrafficConfig.findOne();
+    const requestsCount = config ? (config.requestsPerPing || 1) : 1;
     const pingResults = [];
 
     // Calculate system CPU & memory
@@ -262,17 +285,33 @@ router.post('/ping', protect, admin, async (req, res) => {
     const cpuPercent = Math.min(100, Math.max(12, Math.round((loadAvg / (cpus.length || 1)) * 100)));
 
     for (const server of servers) {
-      const startTime = Date.now();
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3-second timeout
+      let totalLatency = 0;
+      let successfulReqs = 0;
+      let lastStatus = 'offline';
 
-        const response = await fetch(`${server.url}/api/traffic/public-config`, { signal: controller.signal });
-        clearTimeout(timeoutId);
+      for (let i = 0; i < requestsCount; i++) {
+        const startTime = Date.now();
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 3500); // 3.5s timeout
 
-        const responseTime = Date.now() - startTime;
-        server.status = response.ok || response.status < 500 ? 'online' : 'offline';
-        server.responseTime = responseTime;
+          const response = await fetch(`${server.url}/api/traffic/public-config`, { signal: controller.signal });
+          clearTimeout(timeoutId);
+
+          if (response.ok || response.status < 500) {
+            totalLatency += (Date.now() - startTime);
+            successfulReqs++;
+            lastStatus = 'online';
+          }
+        } catch (err) {
+          console.error(`Ping attempt ${i + 1} to ${server.name} failed`, err);
+        }
+      }
+
+      if (successfulReqs > 0) {
+        const avgResponseTime = Math.round(totalLatency / successfulReqs);
+        server.status = 'online';
+        server.responseTime = avgResponseTime;
         server.cpuUsage = server.url.includes('localhost') ? cpuPercent : Math.floor(Math.random() * 25) + 15;
         server.memoryUsage = server.url.includes('localhost') ? memPercent : Math.floor(Math.random() * 30) + 25;
         await server.save();
@@ -282,12 +321,13 @@ router.post('/ping', protect, admin, async (req, res) => {
           _id: server._id.toString(),
           name: server.name,
           url: server.url,
-          status: server.status,
-          responseTime,
+          status: 'online',
+          responseTime: avgResponseTime,
           cpuUsage: server.cpuUsage,
-          memoryUsage: server.memoryUsage
+          memoryUsage: server.memoryUsage,
+          requestsSent: requestsCount
         });
-      } catch (err) {
+      } else {
         server.status = 'offline';
         server.responseTime = 0;
         await server.save();
@@ -300,7 +340,8 @@ router.post('/ping', protect, admin, async (req, res) => {
           status: 'offline',
           responseTime: 0,
           cpuUsage: 0,
-          memoryUsage: 0
+          memoryUsage: 0,
+          requestsSent: requestsCount
         });
       }
     }
