@@ -288,14 +288,15 @@ router.post('/ping', protect, admin, async (req, res) => {
       let totalLatency = 0;
       let successfulReqs = 0;
       let lastStatus = 'offline';
+      const cleanUrl = server.url.trim().endsWith('/') ? server.url.trim().slice(0, -1) : server.url.trim();
 
       for (let i = 0; i < requestsCount; i++) {
         const startTime = Date.now();
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 3500); // 3.5s timeout
+          const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s timeout for Render cold-starts
 
-          const response = await fetch(`${server.url}/api/traffic/public-config`, { signal: controller.signal });
+          const response = await fetch(`${cleanUrl}/api/traffic/public-config`, { signal: controller.signal });
           clearTimeout(timeoutId);
 
           if (response.ok || response.status < 500) {
