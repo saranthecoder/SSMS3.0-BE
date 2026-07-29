@@ -96,11 +96,12 @@ const autoCloseAllOldSessions = async () => {
       if (record.isLeave && (record.leaveHours || 0) === 0) {
         record.status = 'Leave';
       } else {
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(record.studentId);
         const hours = (record.sessionDurationSeconds || 0) / 3600;
-        const minRequired = 8 - (record.leaveHours || 0);
-        if (hours >= minRequired && hours <= 10) {
+        const minRequired = requiredPresentHours - (record.leaveHours || 0);
+        if (hours >= minRequired && hours <= maxValidHours) {
           record.status = 'Present';
-        } else if (hours > 10) {
+        } else if (hours > maxValidHours) {
           record.status = 'Invalid';
         } else {
           record.status = 'Absent';
@@ -505,8 +506,14 @@ const getMyAttendanceSummary = async (req, res) => {
     const enrollments = await Enrollment.find({ studentId: req.user._id, status: 'approved' }).populate('batchId').lean();
     
     let batchStartDate = null;
+    let reqHours = 8;
+    let maxHours = 10;
+
     if (enrollments.length > 0 && enrollments[0].batchId) {
-      batchStartDate = enrollments[0].batchId.startDate;
+      const b = enrollments[0].batchId;
+      batchStartDate = b.startDate;
+      if (b.requiredPresentHours !== undefined) reqHours = b.requiredPresentHours;
+      if (b.maxValidHours !== undefined) maxHours = b.maxValidHours;
     }
 
     const query = { studentId: req.user._id };
@@ -535,7 +542,9 @@ const getMyAttendanceSummary = async (req, res) => {
         isActive: log.isActive,
         isLeave: log.isLeave,
         leaveHours: log.leaveHours,
-        status: log.status
+        status: log.status,
+        requiredPresentHours: reqHours,
+        maxValidHours: maxHours
       };
     });
     
@@ -568,11 +577,12 @@ const adminCheckOutStudent = async (req, res) => {
       if (attendance.isLeave && (attendance.leaveHours || 0) === 0) {
         attendance.status = 'Leave';
       } else {
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(attendance.studentId);
         const hours = (attendance.sessionDurationSeconds || 0) / 3600;
-        const minRequired = 8 - (attendance.leaveHours || 0);
-        if (hours >= minRequired && hours <= 10) {
+        const minRequired = requiredPresentHours - (attendance.leaveHours || 0);
+        if (hours >= minRequired && hours <= maxValidHours) {
           attendance.status = 'Present';
-        } else if (hours > 10) {
+        } else if (hours > maxValidHours) {
           attendance.status = 'Invalid';
         } else {
           attendance.status = 'Absent';
@@ -622,11 +632,12 @@ const adminCheckOutAll = async (req, res) => {
       if (attendance.isLeave && (attendance.leaveHours || 0) === 0) {
         attendance.status = 'Leave';
       } else {
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(attendance.studentId);
         const hours = (attendance.sessionDurationSeconds || 0) / 3600;
-        const minRequired = 8 - (attendance.leaveHours || 0);
-        if (hours >= minRequired && hours <= 10) {
+        const minRequired = requiredPresentHours - (attendance.leaveHours || 0);
+        if (hours >= minRequired && hours <= maxValidHours) {
           attendance.status = 'Present';
-        } else if (hours > 10) {
+        } else if (hours > maxValidHours) {
           attendance.status = 'Invalid';
         } else {
           attendance.status = 'Absent';

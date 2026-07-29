@@ -233,11 +233,13 @@ const getBatchReport = async (req, res) => {
           if ((record.isLeave || record.status === 'Leave') && (record.leaveHours || 0) === 0) {
             leaveCount++;
           } else {
+            const reqHours = batch.requiredPresentHours !== undefined ? batch.requiredPresentHours : 8;
+            const maxHours = batch.maxValidHours !== undefined ? batch.maxValidHours : 10;
             const hours = (record.sessionDurationSeconds || 0) / 3600;
-            const minRequired = 8 - (record.leaveHours || 0);
-            if (hours >= minRequired && hours <= 10) {
+            const minRequired = reqHours - (record.leaveHours || 0);
+            if (hours >= minRequired && hours <= maxHours) {
               presentCount++;
-            } else if (hours > 10) {
+            } else if (hours > maxHours) {
               invalidCount++;
             } else if (record.isActive) {
               inProgressCount++;
@@ -320,11 +322,13 @@ const getBatchReport = async (req, res) => {
           if ((record.isLeave || record.status === 'Leave') && (record.leaveHours || 0) === 0) {
             status = 'Leave';
           } else {
+            const reqHours = batch.requiredPresentHours !== undefined ? batch.requiredPresentHours : 8;
+            const maxHours = batch.maxValidHours !== undefined ? batch.maxValidHours : 10;
             const hours = (record.sessionDurationSeconds || 0) / 3600;
-            const minRequired = 8 - (record.leaveHours || 0);
-            if (hours >= minRequired && hours <= 10) {
+            const minRequired = reqHours - (record.leaveHours || 0);
+            if (hours >= minRequired && hours <= maxHours) {
               status = 'Present';
-            } else if (hours > 10) {
+            } else if (hours > maxHours) {
               status = 'Invalid';
             } else if (record.isActive) {
               status = 'In Progress';

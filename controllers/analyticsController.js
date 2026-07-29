@@ -497,13 +497,16 @@ const getStudentAnalytics = async (req, res) => {
     let present = 0, absent = 0, leave = 0, inProgress = 0, invalid = 0;
     const todayDateStr = new Date(Date.now() - (new Date().getTimezoneOffset() * 60000)).toISOString().split('T')[0];
     
+    const reqHours = (enrollments.length > 0 && enrollments[0].batchId && enrollments[0].batchId.requiredPresentHours !== undefined) ? enrollments[0].batchId.requiredPresentHours : 8;
+    const maxHours = (enrollments.length > 0 && enrollments[0].batchId && enrollments[0].batchId.maxValidHours !== undefined) ? enrollments[0].batchId.maxValidHours : 10;
+
     Object.entries(dayMap).forEach(([dateKey, day]) => {
       if (dateKey === todayDateStr) return; // skip today
       if (day.isLeave && (day.leaveHours || 0) === 0) { leave++; return; }
       const hours = day.totalSeconds / 3600;
-      const minRequired = 8 - day.leaveHours;
-      if (hours >= minRequired && hours <= 10) { present++; }
-      else if (hours > 10) { invalid++; }
+      const minRequired = reqHours - (day.leaveHours || 0);
+      if (hours >= minRequired && hours <= maxHours) { present++; }
+      else if (hours > maxHours) { invalid++; }
       else if (day.isActive) { inProgress++; }
       else { absent++; }
     });

@@ -215,11 +215,13 @@ cron.schedule('0 0 * * *', async () => {
       if (record.isLeave && (record.leaveHours || 0) === 0) {
         record.status = 'Leave';
       } else {
+        const { getBatchHourLimits } = require('./controllers/attendanceController');
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(record.studentId);
         const hours = (record.sessionDurationSeconds || 0) / 3600;
-        const minRequired = 8 - (record.leaveHours || 0);
-        if (hours >= minRequired && hours <= 10) {
+        const minRequired = requiredPresentHours - (record.leaveHours || 0);
+        if (hours >= minRequired && hours <= maxValidHours) {
           record.status = 'Present';
-        } else if (hours > 10) {
+        } else if (hours > maxValidHours) {
           record.status = 'Invalid';
         } else {
           record.status = 'Absent';

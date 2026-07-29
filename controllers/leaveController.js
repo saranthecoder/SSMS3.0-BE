@@ -153,9 +153,10 @@ const updateLeaveStatus = async (req, res) => {
           attendance.leaveHours = diffHours;
           attendance.isLeave = true;
           
-          // Re-evaluate status: if they already checked in and completed adjusted hours, mark Present
+          const { getBatchHourLimits } = require('./attendanceController');
+          const { requiredPresentHours } = await getBatchHourLimits(leave.studentId);
           const checkedInHours = (attendance.sessionDurationSeconds || 0) / 3600;
-          const minRequired = Math.max(0, 8 - diffHours);
+          const minRequired = Math.max(0, requiredPresentHours - diffHours);
           
           if (checkedInHours >= minRequired && checkedInHours > 0) {
             attendance.status = 'Present';
