@@ -361,8 +361,9 @@ const downloadStudentTemplate = async (req, res) => {
   try {
     const XLSX = require('xlsx');
     const sampleData = [
-      { 'Name': 'John Doe', 'Register Number': 'REG2026001', 'Password': 'Password@123', 'Email': 'reg2026001@student.ssms' },
-      { 'Name': 'Jane Smith', 'Register Number': 'REG2026002', 'Password': 'Password@123', 'Email': 'reg2026002@student.ssms' }
+      { 'Name': 'ADHITHYA V', 'Register Number': '4MH23CB001', 'Password': 'Password@123' },
+      { 'Name': 'AISHWARYA N K', 'Register Number': '4MH23CB002', 'Password': 'Password@124' },
+      { 'Name': 'ANUSHA S K', 'Register Number': '4MH23CB003', 'Password': 'Password@125' }
     ];
 
     const wb = XLSX.utils.book_new();
@@ -375,6 +376,52 @@ const downloadStudentTemplate = async (req, res) => {
     res.send(buffer);
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Fetch and parse data from a Google Sheet URL
+// @route   POST /api/batches/fetch-google-sheet
+// @access  Private/Admin
+const fetchGoogleSheetData = async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) {
+      return res.status(400).json({ message: 'Google Sheet URL is required' });
+    }
+
+    const sheetIdMatch = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (!sheetIdMatch) {
+      return res.status(400).json({ message: 'Invalid Google Sheet URL format' });
+    }
+    const spreadsheetId = sheetIdMatch[1];
+
+    const gidMatch = url.match(/[?&]gid=([0-9]+)/) || url.match(/#gid=([0-9]+)/);
+    const gid = gidMatch ? gidMatch[1] : null;
+
+    let csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv`;
+    if (gid) {
+      csvUrl += `&gid=${gid}`;
+    }
+
+    const axios = require('axios');
+    const XLSX = require('xlsx');
+
+    const response = await axios.get(csvUrl, { responseType: 'arraybuffer' });
+    const wb = XLSX.read(response.data, { type: 'buffer' });
+    const wsName = wb.SheetNames[0];
+    const ws = wb.Sheets[wsName];
+    const rawData = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+    if (!Array.isArray(rawData) || rawData.length === 0) {
+      return res.status(400).json({ message: 'No records found in the Google Sheet' });
+    }
+
+    res.json({ success: true, count: rawData.length, data: rawData });
+  } catch (error) {
+    console.error('Google Sheet fetch error:', error.message);
+    res.status(500).json({
+      message: 'Failed to fetch Google Sheet. Make sure the sheet link is set to "Anyone with the link can view".'
+    });
   }
 };
 
@@ -421,7 +468,10 @@ const bulkUploadStudents = async (req, res) => {
 
       try {
         let user = await User.findOne({
-          $or: [{ rollNumber: rollNumber }, { email: email }]
+          $or: [
+            { rollNumber: { $regex: new RegExp(`^${rollNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
+            { email: email }
+          ]
         });
 
         if (!user) {
@@ -430,7 +480,8 @@ const bulkUploadStudents = async (req, res) => {
             rollNumber,
             email,
             password,
-            role: 'student'
+            role: 'student',
+            isProfileComplete: false
           });
           createdCount++;
         } else {
@@ -477,5 +528,6 @@ module.exports = {
   deleteBatch,
   getBatchReport,
   downloadStudentTemplate,
+  fetchGoogleSheetData,
   bulkUploadStudents
 };

@@ -8,6 +8,7 @@ const {
   deleteBatch,
   getBatchReport,
   downloadStudentTemplate,
+  fetchGoogleSheetData,
   bulkUploadStudents
 } = require('../controllers/batchController');
 const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
@@ -18,6 +19,9 @@ router.route('/')
 
 router.route('/template/excel')
   .get(protect, admin, downloadStudentTemplate);
+
+router.route('/fetch-google-sheet')
+  .post(protect, admin, fetchGoogleSheetData);
 
 router.route('/:id')
   .get(protect, getBatchById)

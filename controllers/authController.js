@@ -7,10 +7,20 @@ const generateToken = require('../utils/generateToken');
 // @access  Public
 const loginUser = async (req, res) => {
   try {
-    const { email, password } = req.body;
-    const normalizedEmail = email ? email.toLowerCase().trim() : '';
+    const { email, rollNumber, registerNumber, identifier, password } = req.body;
+    const inputId = (identifier || rollNumber || registerNumber || email || '').toString().trim();
 
-    const user = await User.findOne({ email: normalizedEmail }).select('+password');
+    if (!inputId || !password) {
+      return res.status(400).json({ message: 'Please provide Register Number / Email and password' });
+    }
+
+    // Search by rollNumber (case-insensitive exact match) or email
+    const user = await User.findOne({
+      $or: [
+        { rollNumber: { $regex: new RegExp(`^${inputId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
+        { email: inputId.toLowerCase() }
+      ]
+    }).select('+password');
 
     if (user && (await user.matchPassword(password))) {
       generateToken(res, user._id);
@@ -34,7 +44,7 @@ const loginUser = async (req, res) => {
         totalLeetcodeSubmissions: user.totalLeetcodeSubmissions,
       });
     } else {
-      res.status(401).json({ message: 'Invalid email or password' });
+      res.status(401).json({ message: 'Invalid credentials. Please check your Register Number / Email and password.' });
     }
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -167,6 +177,17 @@ const updateUserProfile = async (req, res) => {
       user.portfolio = req.body.portfolio !== undefined ? req.body.portfolio : user.portfolio;
       user.leetcode = req.body.leetcode !== undefined ? req.body.leetcode : user.leetcode;
       user.hackerrank = req.body.hackerrank !== undefined ? req.body.hackerrank : user.hackerrank;
+      
+      if (req.body.email && req.body.email.trim() !== '') {
+        const newEmail = req.body.email.toLowerCase().trim();
+        if (newEmail !== user.email) {
+          const emailExists = await User.findOne({ email: newEmail, _id: { $ne: user._id } });
+          if (emailExists) {
+            return res.status(400).json({ message: 'This email address is already in use by another user' });
+          }
+          user.email = newEmail;
+        }
+      }
       
       if (req.body.isProfileComplete !== undefined) {
         user.isProfileComplete = req.body.isProfileComplete;
