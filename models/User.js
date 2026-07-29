@@ -141,13 +141,16 @@ userSchema.pre('save', async function() {
     return;
   }
 
-  const salt = await bcrypt.genSalt(10);
-  this.password = await bcrypt.hash(this.password, salt);
+  if (!this.password.startsWith('$2a$') && !this.password.startsWith('$2b$')) {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password.toString().trim(), salt);
+  }
 });
 
 // Match user entered password to hashed password in database
 userSchema.methods.matchPassword = async function(enteredPassword) {
-  return await bcrypt.compare(enteredPassword, this.password);
+  if (!enteredPassword || !this.password) return false;
+  return await bcrypt.compare(enteredPassword.toString().trim(), this.password);
 };
 
 module.exports = mongoose.model('User', userSchema);

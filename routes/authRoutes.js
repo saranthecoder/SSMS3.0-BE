@@ -18,7 +18,7 @@ router.post('/logout', logoutUser);
 router.get('/profile', protect, getUserProfile);
 router.put('/profile', protect, updateUserProfile);
 router.get('/students', protect, mentorOrAdmin, getAllStudents);
-router.put('/students/:id/password', protect, admin, adminUpdateStudentPassword);
-router.put('/students/:id', protect, admin, adminUpdateStudentProfile);
+router.put('/students/:id/password', protect, mentorOrAdmin, adminUpdateStudentPassword);
+router.put('/students/:id', protect, mentorOrAdmin, adminUpdateStudentProfile);
 
 module.exports = router;
