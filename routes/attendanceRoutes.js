@@ -12,17 +12,17 @@ const {
   getActiveCount,
   updateAttendanceRecord
 } = require('../controllers/attendanceController');
-const { protect, admin } = require('../middleware/authMiddleware');
+const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
 
 router.get('/active-count', protect, getActiveCount);
 router.post('/checkin', protect, checkIn);
 router.post('/checkout/:id', protect, checkOut);
-router.get('/', protect, admin, getAllAttendance);
+router.get('/', protect, mentorOrAdmin, getAllAttendance);
 router.get('/summary', protect, getAttendanceSummary);
 router.get('/my', protect, getMyAttendance);
 router.get('/my-summary', protect, getMyAttendanceSummary);
-router.put('/admin/checkout/:id', protect, admin, adminCheckOutStudent);
-router.put('/admin/checkout-all', protect, admin, adminCheckOutAll);
-router.put('/:id', protect, admin, updateAttendanceRecord);
+router.put('/admin/checkout/:id', protect, mentorOrAdmin, adminCheckOutStudent);
+router.put('/admin/checkout-all', protect, mentorOrAdmin, adminCheckOutAll);
+router.put('/:id', protect, mentorOrAdmin, updateAttendanceRecord);
 
 module.exports = router;
