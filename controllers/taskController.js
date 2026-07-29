@@ -38,36 +38,23 @@ const getTasks = async (req, res) => {
     const { batchId } = req.query;
     let query = {};
 
-    if (req.user.role === 'mentor') {
+    if (batchId && batchId !== 'all') {
+      query.batchId = batchId;
+    } else if (req.user.role === 'mentor') {
       const Batch = require('../models/Batch');
-      const mentorBatches = await Batch.find({ mentorId: req.user._id }).select('_id').lean();
-      const mentorBatchIds = mentorBatches.map(b => b._id.toString());
-
-      if (batchId) {
-        if (mentorBatchIds.includes(batchId.toString())) {
-          query.batchId = batchId;
-        } else {
-          query.batchId = null;
-        }
-      } else {
-        query.batchId = { $in: mentorBatchIds };
-      }
+      const mentorBatches = await Batch.find({ 
+        $or: [{ mentorId: req.user._id }, { mentors: req.user._id }] 
+      }).select('_id').lean();
+      const mentorBatchIds = mentorBatches.map(b => b._id);
+      query.$or = [
+        { batchId: { $in: mentorBatchIds } },
+        { createdBy: req.user._id }
+      ];
     } else if (req.user.role === 'student') {
       const Enrollment = require('../models/Enrollment');
       const enrollments = await Enrollment.find({ studentId: req.user._id, status: 'approved' }).select('batchId').lean();
-      const myBatchIds = enrollments.map(e => e.batchId.toString());
-
-      if (batchId) {
-        if (myBatchIds.includes(batchId.toString())) {
-          query.batchId = batchId;
-        } else {
-          query.batchId = null;
-        }
-      } else {
-        query.batchId = { $in: myBatchIds };
-      }
-    } else if (batchId) {
-      query.batchId = batchId;
+      const myBatchIds = enrollments.map(e => e.batchId);
+      query.batchId = { $in: myBatchIds };
     }
 
     const tasks = await Task.find(query).populate('batchId', 'batchName').sort({ createdAt: -1 }).lean();

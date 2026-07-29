@@ -428,21 +428,7 @@ const getAttendanceSummary = async (req, res) => {
     let query = {};
     let batchStartDate = null;
     
-    if (req.user.role === 'mentor') {
-      const mentorBatches = await Batch.find({ mentorId: req.user._id }).select('_id startDate').lean();
-      const mentorBatchIds = mentorBatches.map(b => b._id);
-      
-      let targetBatchIds = mentorBatchIds;
-      if (batchId && mentorBatchIds.map(id => id.toString()).includes(batchId.toString())) {
-        targetBatchIds = [batchId];
-        const selectedBatch = mentorBatches.find(b => b._id.toString() === batchId.toString());
-        if (selectedBatch && selectedBatch.startDate) batchStartDate = selectedBatch.startDate;
-      }
-      
-      const enrollments = await Enrollment.find({ batchId: { $in: targetBatchIds }, status: 'approved' }).select('studentId').lean();
-      const studentIds = enrollments.map(e => e.studentId);
-      query = { studentId: { $in: studentIds } };
-    } else if (batchId) {
+    if (batchId && batchId !== 'all') {
       const enrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
       const studentIds = enrollments.map(e => e.studentId);
       query = { studentId: { $in: studentIds } };
@@ -451,6 +437,15 @@ const getAttendanceSummary = async (req, res) => {
       if (batch && batch.startDate) {
         batchStartDate = batch.startDate;
       }
+    } else if (req.user.role === 'mentor') {
+      const mentorBatches = await Batch.find({ 
+        $or: [{ mentorId: req.user._id }, { mentors: req.user._id }] 
+      }).select('_id startDate').lean();
+      const mentorBatchIds = mentorBatches.map(b => b._id);
+      
+      const enrollments = await Enrollment.find({ batchId: { $in: mentorBatchIds }, status: 'approved' }).select('studentId').lean();
+      const studentIds = enrollments.map(e => e.studentId);
+      query = { studentId: { $in: studentIds } };
     }
 
     if (batchStartDate) {
