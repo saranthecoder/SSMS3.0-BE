@@ -5,6 +5,7 @@ const Submission = require('./models/Submission');
 const Grade = require('./models/Grade');
 const Task = require('./models/Task');
 
+
 async function run() {
   await mongoose.connect(process.env.MONGODB_URI);
   console.log("Connected to DB");
