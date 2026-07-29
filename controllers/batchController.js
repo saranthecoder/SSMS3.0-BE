@@ -509,7 +509,7 @@ const bulkUploadStudents = async (req, res) => {
       }
 
       if (!email) {
-        email = `${rollNumber.toLowerCase().replace(/[^a-z0-9]/g, '')}@student.ssms`;
+        email = `${rollNumber.toLowerCase().replace(/[^a-z0-9]/g, '')}@student.ssms.edu`;
       }
 
       try {
