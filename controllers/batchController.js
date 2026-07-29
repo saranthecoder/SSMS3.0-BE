@@ -389,38 +389,84 @@ const fetchGoogleSheetData = async (req, res) => {
       return res.status(400).json({ message: 'Google Sheet URL is required' });
     }
 
-    const sheetIdMatch = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-    if (!sheetIdMatch) {
-      return res.status(400).json({ message: 'Invalid Google Sheet URL format' });
+    let spreadsheetId = null;
+    let isPublishedUrl = false;
+
+    const pubMatch = url.match(/\/spreadsheets\/d\/e\/([a-zA-Z0-9-_]+)/);
+    if (pubMatch) {
+      spreadsheetId = pubMatch[1];
+      isPublishedUrl = true;
+    } else {
+      const stdMatch = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      if (stdMatch) {
+        spreadsheetId = stdMatch[1];
+      }
     }
-    const spreadsheetId = sheetIdMatch[1];
+
+    if (!spreadsheetId) {
+      return res.status(400).json({ message: 'Invalid Google Sheet URL format. Please paste a valid Google Sheet link.' });
+    }
 
     const gidMatch = url.match(/[?&]gid=([0-9]+)/) || url.match(/#gid=([0-9]+)/);
-    const gid = gidMatch ? gidMatch[1] : null;
+    const gid = gidMatch ? gidMatch[1] : '0';
 
-    let csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv`;
-    if (gid) {
-      csvUrl += `&gid=${gid}`;
+    let candidateUrls = [];
+    if (isPublishedUrl) {
+      candidateUrls.push(`https://docs.google.com/spreadsheets/d/e/${spreadsheetId}/pub?output=csv${gid ? `&gid=${gid}` : ''}`);
+    } else {
+      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`);
+      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/pub?output=csv&gid=${gid}`);
+      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=out:csv&gid=${gid}`);
     }
 
-    const axios = require('axios');
     const XLSX = require('xlsx');
+    let csvBuffer = null;
 
-    const response = await axios.get(csvUrl, { responseType: 'arraybuffer' });
-    const wb = XLSX.read(response.data, { type: 'buffer' });
+    for (const targetUrl of candidateUrls) {
+      try {
+        const response = await fetch(targetUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/csv,text/plain,application/json,*/*'
+          },
+          redirect: 'follow'
+        });
+
+        if (response.ok) {
+          const contentType = response.headers.get('content-type') || '';
+          const buffer = Buffer.from(await response.arrayBuffer());
+          const textPreview = buffer.toString('utf8', 0, 300).trim().toLowerCase();
+
+          if (!textPreview.startsWith('<!doctype') && !textPreview.startsWith('<html') && !contentType.includes('text/html')) {
+            csvBuffer = buffer;
+            break;
+          }
+        }
+      } catch (err) {
+        // Continue checking fallback candidate URLs
+      }
+    }
+
+    if (!csvBuffer) {
+      return res.status(400).json({
+        message: 'Google Sheets requires this sheet to be published. In Google Sheets, click File -> Share -> Publish to web, choose CSV, click Publish, and paste that link here. Or click File -> Download -> Microsoft Excel (.xlsx) and upload the file.'
+      });
+    }
+
+    const wb = XLSX.read(csvBuffer, { type: 'buffer' });
     const wsName = wb.SheetNames[0];
     const ws = wb.Sheets[wsName];
     const rawData = XLSX.utils.sheet_to_json(ws, { defval: '' });
 
     if (!Array.isArray(rawData) || rawData.length === 0) {
-      return res.status(400).json({ message: 'No records found in the Google Sheet' });
+      return res.status(400).json({ message: 'No student records found in the Google Sheet' });
     }
 
     res.json({ success: true, count: rawData.length, data: rawData });
   } catch (error) {
     console.error('Google Sheet fetch error:', error.message);
     res.status(500).json({
-      message: 'Failed to fetch Google Sheet. Make sure the sheet link is set to "Anyone with the link can view".'
+      message: 'Failed to fetch Google Sheet. Please download as Excel (.xlsx) and use Choose Excel File.'
     });
   }
 };
