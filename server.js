@@ -152,12 +152,7 @@ app.get('/', (req, res) => {
   res.send('LMS API is running');
 });
 
-let PORT = process.env.PORT || 3000;
-if (process.env.RENDER === 'true') {
-  // Render's dashboard config defaults/expects port 5000 if auto-detected from 'PORT || 5000',
-  // but Render still injects PORT=10000 into the env variables. Force port 5000 to match routing.
-  PORT = 3000;
-}
+const PORT = process.env.PORT || 3000;
 
 // Setup node-cron for LeetCode streak logic
 const cron = require('node-cron');
