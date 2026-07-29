@@ -389,34 +389,34 @@ const fetchGoogleSheetData = async (req, res) => {
       return res.status(400).json({ message: 'Google Sheet URL is required' });
     }
 
-    let spreadsheetId = null;
-    let isPublishedUrl = false;
+    let candidateUrls = [];
+    
+    // Always include the user-provided URL directly first
+    candidateUrls.push(url.trim());
+
+    let pubId = null;
+    let stdId = null;
 
     const pubMatch = url.match(/\/spreadsheets\/d\/e\/([a-zA-Z0-9-_]+)/);
     if (pubMatch) {
-      spreadsheetId = pubMatch[1];
-      isPublishedUrl = true;
+      pubId = pubMatch[1];
     } else {
-      const stdMatch = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      const stdMatch = url.match(/\/spreadsheets\/d\/(?!e\/)([a-zA-Z0-9-_]+)/);
       if (stdMatch) {
-        spreadsheetId = stdMatch[1];
+        stdId = stdMatch[1];
       }
-    }
-
-    if (!spreadsheetId) {
-      return res.status(400).json({ message: 'Invalid Google Sheet URL format. Please paste a valid Google Sheet link.' });
     }
 
     const gidMatch = url.match(/[?&]gid=([0-9]+)/) || url.match(/#gid=([0-9]+)/);
     const gid = gidMatch ? gidMatch[1] : '0';
 
-    let candidateUrls = [];
-    if (isPublishedUrl) {
-      candidateUrls.push(`https://docs.google.com/spreadsheets/d/e/${spreadsheetId}/pub?output=csv${gid ? `&gid=${gid}` : ''}`);
-    } else {
-      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`);
-      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/pub?output=csv&gid=${gid}`);
-      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=out:csv&gid=${gid}`);
+    if (pubId) {
+      candidateUrls.push(`https://docs.google.com/spreadsheets/d/e/${pubId}/pub?gid=${gid}&single=true&output=csv`);
+    }
+    if (stdId) {
+      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${stdId}/export?format=csv&gid=${gid}`);
+      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${stdId}/pub?output=csv&gid=${gid}`);
+      candidateUrls.push(`https://docs.google.com/spreadsheets/d/${stdId}/gviz/tq?tqx=out:csv&gid=${gid}`);
     }
 
     const XLSX = require('xlsx');
@@ -443,7 +443,7 @@ const fetchGoogleSheetData = async (req, res) => {
           }
         }
       } catch (err) {
-        // Continue checking fallback candidate URLs
+        // Continue checking candidate URLs
       }
     }
 
