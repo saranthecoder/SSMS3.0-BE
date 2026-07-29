@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { protect, admin } = require('../middleware/authMiddleware');
+const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
 const {
   getNotes,
   addNote,
@@ -10,10 +10,10 @@ const {
 
 router.route('/')
   .get(protect, getNotes)
-  .post(protect, admin, addNote);
+  .post(protect, mentorOrAdmin, addNote);
 
 router.route('/:id')
-  .put(protect, admin, editNote)
-  .delete(protect, admin, deleteNote);
+  .put(protect, mentorOrAdmin, editNote)
+  .delete(protect, mentorOrAdmin, deleteNote);
 
 module.exports = router;

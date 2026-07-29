@@ -9,16 +9,16 @@ const {
   updateProblem,
   deleteProblem
 } = require('../controllers/leetcodeController');
-const { protect, admin } = require('../middleware/authMiddleware');
+const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
 
-router.post('/', protect, admin, allocateProblem);
+router.post('/', protect, mentorOrAdmin, allocateProblem);
 router.get('/active', protect, getActiveProblems);
 router.get('/history', protect, getStudentLeetcodeHistory);
 router.post('/:id/submit', protect, submitSolution);
 router.get('/batch/:batchId', protect, getBatchProblems);
 
 router.route('/:id')
-  .put(protect, admin, updateProblem)
-  .delete(protect, admin, deleteProblem);
+  .put(protect, mentorOrAdmin, updateProblem)
+  .delete(protect, mentorOrAdmin, deleteProblem);
 
 module.exports = router;

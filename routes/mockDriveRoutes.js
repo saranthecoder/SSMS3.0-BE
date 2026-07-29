@@ -15,15 +15,15 @@ const {
   getMockDriveScores,
   updateMockDrive
 } = require('../controllers/mockDriveController');
-const { protect, admin } = require('../middleware/authMiddleware');
+const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
 
-router.post('/parse-excel', protect, admin, upload.single('file'), parseMockDriveExcel);
-router.post('/', protect, admin, saveMockDrive);
+router.post('/parse-excel', protect, mentorOrAdmin, upload.single('file'), parseMockDriveExcel);
+router.post('/', protect, mentorOrAdmin, saveMockDrive);
 router.get('/batch/:batchId', protect, getMockDrivesByBatch);
 router.get('/student/:studentId', protect, getStudentMockDriveScores);
-router.get('/:id/scores', protect, admin, getMockDriveScores);
-router.put('/:id', protect, admin, updateMockDrive);
-router.delete('/:id', protect, admin, deleteMockDrive);
-router.put('/:id/score', protect, admin, updateStudentScoreManually);
+router.get('/:id/scores', protect, mentorOrAdmin, getMockDriveScores);
+router.put('/:id', protect, mentorOrAdmin, updateMockDrive);
+router.delete('/:id', protect, mentorOrAdmin, deleteMockDrive);
+router.put('/:id/score', protect, mentorOrAdmin, updateStudentScoreManually);
 
 module.exports = router;

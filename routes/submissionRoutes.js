@@ -6,7 +6,7 @@ const {
   getSubmissionById,
   requestResubmit
 } = require('../controllers/submissionController');
-const { protect, admin } = require('../middleware/authMiddleware');
+const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
 
 router.route('/')
   .post(protect, submitTask)
@@ -16,6 +16,6 @@ router.route('/:id')
   .get(protect, getSubmissionById);
 
 router.route('/:id/resubmit')
-  .put(protect, admin, requestResubmit);
+  .put(protect, mentorOrAdmin, requestResubmit);
 
 module.exports = router;

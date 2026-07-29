@@ -7,20 +7,20 @@ const {
   getGradeBySubmission,
   autoEvaluateSubmissions
 } = require('../controllers/gradeController');
-const { protect, admin } = require('../middleware/authMiddleware');
+const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
 
 router.route('/')
-  .post(protect, admin, addGrade);
+  .post(protect, mentorOrAdmin, addGrade);
 
-router.post('/auto-evaluate', protect, admin, autoEvaluateSubmissions);
+router.post('/auto-evaluate', protect, mentorOrAdmin, autoEvaluateSubmissions);
 
 router.route('/:id')
-  .put(protect, admin, updateGrade);
+  .put(protect, mentorOrAdmin, updateGrade);
 
 router.route('/student/:studentId')
   .get(protect, getStudentGrades);
 
 router.route('/submission/:submissionId')
-  .get(protect, admin, getGradeBySubmission);
+  .get(protect, mentorOrAdmin, getGradeBySubmission);
 
 module.exports = router;
