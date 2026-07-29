@@ -18,10 +18,10 @@ router.route('/')
   .post(protect, mentorOrAdmin, createBatch);
 
 router.route('/template/excel')
-  .get(protect, admin, downloadStudentTemplate);
+  .get(protect, mentorOrAdmin, downloadStudentTemplate);
 
 router.route('/fetch-google-sheet')
-  .post(protect, admin, fetchGoogleSheetData);
+  .post(protect, mentorOrAdmin, fetchGoogleSheetData);
 
 router.route('/:id')
   .get(protect, getBatchById)
@@ -32,6 +32,6 @@ router.route('/:id/report')
   .get(protect, mentorOrAdmin, getBatchReport);
 
 router.route('/:id/bulk-upload-students')
-  .post(protect, admin, bulkUploadStudents);
+  .post(protect, mentorOrAdmin, bulkUploadStudents);
 
 module.exports = router;
