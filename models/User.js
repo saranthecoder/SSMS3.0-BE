@@ -134,7 +134,6 @@ const userSchema = new mongoose.Schema({
 });
 
 userSchema.index({ role: 1 });
-userSchema.index({ rollNumber: 1 });
 
 // Encrypt password using bcrypt
 userSchema.pre('save', async function() {
