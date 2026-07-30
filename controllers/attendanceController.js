@@ -658,10 +658,70 @@ const adminCheckOutAll = async (req, res) => {
 
 // @desc    Get count of active students
 // @route   GET /api/attendance/active-count
-// @access  Private (Student/Admin)
+// @access  Private (Student/Admin/Mentor)
 const getActiveCount = async (req, res) => {
   try {
-    const activeCount = await Attendance.countDocuments({ isActive: true });
+    const { batchId } = req.query;
+    const Enrollment = require('../models/Enrollment');
+    const Batch = require('../models/Batch');
+
+    let studentIdsToFilter = null;
+
+    if (req.user.role === 'student') {
+      // For student: Find all batch(es) student is enrolled in
+      const studentEnrollments = await Enrollment.find({ studentId: req.user._id, status: 'approved' }).select('batchId').lean();
+      const studentBatchIds = studentEnrollments.map(e => e.batchId).filter(Boolean);
+
+      if (studentBatchIds.length === 0) {
+        return res.json({ activeCount: 0 });
+      }
+
+      // Find all students enrolled in those same batches
+      const peerEnrollments = await Enrollment.find({ batchId: { $in: studentBatchIds }, status: 'approved' }).select('studentId').lean();
+      studentIdsToFilter = [...new Set(peerEnrollments.map(e => e.studentId.toString()))];
+
+    } else if (req.user.role === 'mentor') {
+      // For mentor: Filter by requested batchId or mentor's assigned batches
+      let targetBatchIds = [];
+
+      if (batchId && batchId !== 'all') {
+        targetBatchIds = [batchId];
+      } else {
+        // Find all batches assigned to this mentor
+        const mentorBatches = await Batch.find({ mentorId: req.user._id }).select('_id').lean();
+        targetBatchIds = mentorBatches.map(b => b._id);
+
+        // Also check if mentor object has batches array
+        if (req.user.batches && Array.isArray(req.user.batches) && req.user.batches.length > 0) {
+          req.user.batches.forEach(bId => {
+            if (!targetBatchIds.some(id => id.toString() === bId.toString())) {
+              targetBatchIds.push(bId);
+            }
+          });
+        }
+      }
+
+      if (targetBatchIds.length === 0) {
+        return res.json({ activeCount: 0 });
+      }
+
+      const batchEnrollments = await Enrollment.find({ batchId: { $in: targetBatchIds }, status: 'approved' }).select('studentId').lean();
+      studentIdsToFilter = [...new Set(batchEnrollments.map(e => e.studentId.toString()))];
+
+    } else if (req.user.role === 'admin') {
+      // For admin: If batchId specified and not 'all', filter by that batch; otherwise global count
+      if (batchId && batchId !== 'all') {
+        const batchEnrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
+        studentIdsToFilter = batchEnrollments.map(e => e.studentId).filter(Boolean);
+      }
+    }
+
+    let query = { isActive: true };
+    if (studentIdsToFilter !== null) {
+      query.studentId = { $in: studentIdsToFilter };
+    }
+
+    const activeCount = await Attendance.countDocuments(query);
     res.json({ activeCount });
   } catch (error) {
     res.status(500).json({ message: error.message });
