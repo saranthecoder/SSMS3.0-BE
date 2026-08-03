@@ -4,60 +4,146 @@ const Enrollment = require('../models/Enrollment');
 const User = require('../models/User');
 const xlsx = require('xlsx');
 
+const https = require('https');
+const http = require('http');
+
+// Helper to convert any Google Sheet link format into CSV export URL
+const convertGoogleSheetUrlToCsvUrl = (inputUrl) => {
+  if (!inputUrl) return '';
+  let url = inputUrl.trim();
+
+  if (url.includes('output=csv') || url.includes('format=csv')) {
+    return url;
+  }
+
+  // Case 1: Published Google Sheet: https://docs.google.com/spreadsheets/d/e/2PACX-.../pubhtml
+  if (url.includes('/spreadsheets/d/e/')) {
+    const match = url.match(/\/spreadsheets\/d\/e\/([a-zA-Z0-9-_]+)/);
+    if (match && match[1]) {
+      const pubId = match[1];
+      let csvUrl = `https://docs.google.com/spreadsheets/d/e/${pubId}/pub?output=csv`;
+      const gidMatch = url.match(/[?&]gid=(\d+)/) || url.match(/#gid=(\d+)/);
+      if (gidMatch && gidMatch[1]) {
+        csvUrl += `&gid=${gidMatch[1]}`;
+      }
+      return csvUrl;
+    }
+  }
+
+  // Case 2: Standard Google Sheet: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/...
+  const match = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (match && match[1]) {
+    const sheetId = match[1];
+    let csvUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv`;
+    const gidMatch = url.match(/[?&]gid=(\d+)/) || url.match(/#gid=(\d+)/);
+    if (gidMatch && gidMatch[1]) {
+      csvUrl += `&gid=${gidMatch[1]}`;
+    }
+    return csvUrl;
+  }
+
+  return url;
+};
+
+// Helper to fetch CSV data from a URL with redirect following
+const fetchCsvFromUrl = (url, maxRedirects = 5) => {
+  return new Promise((resolve, reject) => {
+    if (maxRedirects <= 0) return reject(new Error('Too many redirects fetching Google Sheet'));
+
+    const client = url.startsWith('https') ? https : http;
+    client.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return resolve(fetchCsvFromUrl(res.headers.location, maxRedirects - 1));
+      }
+
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Failed to fetch Google Sheet (HTTP ${res.statusCode}). Please ensure the sheet sharing permission is set to "Anyone with the link can view".`));
+      }
+
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', (err) => reject(err));
+    }).on('error', (err) => reject(err));
+  });
+};
+
 // Helper to parse row fields case-insensitively and flexibly
 const parseExcelRow = (row) => {
   let studentName = '';
   let studentEmail = '';
+  let rollNumber = '';
   let mcq = null;
   let aptitude = null;
   let coding = 0;
   let techHr = 0;
   let hr = 0;
-  let totalMarks = 0;
-  let percentage = 0;
-  let grade = 'Fail';
+  let totalMarks = null;
+  let percentage = null;
+  let grade = '';
   const roundScores = [];
 
   Object.keys(row).forEach(key => {
     const k = key.toLowerCase().trim();
     const value = row[key];
+    if (value === undefined || value === null || String(value).trim() === '') return;
 
-    if (k.includes('email')) {
+    if (k.includes('roll') || k.includes('usn') || k.includes('reg') || k.includes('student id')) {
+      rollNumber = String(value).trim();
+    } else if (k.includes('email')) {
       studentEmail = String(value).trim();
     } else if (k.includes('name')) {
       studentName = String(value).trim();
-    } else if (k.includes('apt')) {
-      aptitude = Number(value) || 0;
-      roundScores.push({ name: key.trim(), score: aptitude });
-    } else if (k.includes('mcq')) {
-      mcq = Number(value) || 0;
-      roundScores.push({ name: key.trim(), score: mcq });
-    } else if (k.includes('coding')) {
-      coding = Number(value) || 0;
-      roundScores.push({ name: key.trim(), score: coding });
-    } else if (k.includes('tech hr') || k.includes('techhr') || k.includes('technical')) {
-      techHr = Number(value) || 0;
-      roundScores.push({ name: key.trim(), score: techHr });
-    } else if (k.includes('hr') && !k.includes('tech')) {
-      hr = Number(value) || 0;
-      roundScores.push({ name: key.trim(), score: hr });
-    } else if (k.includes('total')) {
+    } else if (k.includes('total') || k.includes('aggregate')) {
       totalMarks = Number(value) || 0;
-    } else if (k.includes('percent')) {
+    } else if (k.includes('percent') || k.includes('%')) {
       percentage = Number(value) || 0;
-    } else if (k.includes('grade')) {
+    } else if (k.includes('grade') || k.includes('status') || k.includes('result')) {
       grade = String(value).trim();
-    } else if (!isNaN(Number(value)) && !k.includes('sl') && !k.includes('roll') && !k.includes('reg') && !k.includes('s.no') && !k.includes('sno') && !k.includes('status')) {
-      roundScores.push({ name: key.trim(), score: Number(value) || 0 });
+    } else {
+      // Parse round numeric scores dynamically
+      const numVal = Number(value);
+      if (!isNaN(numVal) && !k.includes('sl') && !k.includes('s.no') && !k.includes('sno') && !k.includes('id')) {
+        let roundMaxMarks = 0;
+        const maxMatch = key.match(/\((\d+)\s*marks?\)/i) || key.match(/\((\d+)\)/);
+        if (maxMatch && maxMatch[1]) {
+          roundMaxMarks = Number(maxMatch[1]);
+        }
+
+        roundScores.push({
+          name: key.trim(),
+          score: numVal,
+          maxMarks: roundMaxMarks
+        });
+
+        // Assign legacy fields for fallback
+        if (k.includes('apt')) aptitude = numVal;
+        else if (k.includes('mcq')) mcq = numVal;
+        else if (k.includes('coding') || k.includes('code')) coding = numVal;
+        else if (k.includes('tech hr') || k.includes('techhr') || k.includes('technical')) techHr = numVal;
+        else if (k.includes('hr') && !k.includes('tech')) hr = numVal;
+      }
     }
   });
 
-  return { studentName, studentEmail, mcq, aptitude, coding, techHr, hr, roundScores, totalMarks, percentage, grade };
+  if (totalMarks === null) {
+    if (roundScores.length > 0) {
+      totalMarks = roundScores.reduce((sum, r) => sum + (Number(r.score) || 0), 0);
+    } else {
+      totalMarks = (aptitude || 0) + (mcq || 0) + coding + techHr + hr;
+    }
+  }
+
+  if (!grade) {
+    grade = totalMarks > 0 ? 'Pass' : 'Fail';
+  }
+
+  return { studentName, studentEmail, rollNumber, mcq, aptitude, coding, techHr, hr, roundScores, totalMarks, percentage, grade };
 };
 
 // @desc    Parse uploaded Excel sheet and match students in the batch
 // @route   POST /api/mock-drives/parse-excel
-// @access  Private/Admin
+// @access  Private/Admin/Mentor
 const parseMockDriveExcel = async (req, res) => {
   try {
     const { batchId } = req.body;
@@ -74,7 +160,6 @@ const parseMockDriveExcel = async (req, res) => {
     let ws = null;
     let rawData = [];
 
-    // Search all sheets to find the correct worksheet containing student scores (e.g. MockTest3)
     for (const sheetName of wb.SheetNames) {
       const tempWs = wb.Sheets[sheetName];
       const tempRawData = xlsx.utils.sheet_to_json(tempWs);
@@ -82,9 +167,10 @@ const parseMockDriveExcel = async (req, res) => {
         const headers = Object.keys(tempRawData[0] || {}).map(h => h.toLowerCase().trim());
         const hasEmail = headers.some(h => h.includes('email'));
         const hasName = headers.some(h => h.includes('name'));
-        const hasScoreFields = headers.some(h => h.includes('apt') || h.includes('mcq') || h.includes('coding') || h.includes('total'));
+        const hasRoll = headers.some(h => h.includes('roll') || h.includes('usn') || h.includes('reg'));
+        const hasScoreFields = headers.some(h => h.includes('apt') || h.includes('mcq') || h.includes('coding') || h.includes('total') || h.includes('round') || h.includes('mark'));
 
-        if ((hasEmail || hasName) && hasScoreFields) {
+        if ((hasEmail || hasName || hasRoll) && hasScoreFields) {
           ws = tempWs;
           rawData = tempRawData;
           break;
@@ -92,7 +178,6 @@ const parseMockDriveExcel = async (req, res) => {
       }
     }
 
-    // Fallback to the first worksheet if no sheet satisfies the auto-detect signature
     if (!ws) {
       ws = wb.Sheets[wb.SheetNames[0]];
       rawData = xlsx.utils.sheet_to_json(ws);
@@ -102,39 +187,57 @@ const parseMockDriveExcel = async (req, res) => {
 
     // Extract dynamic max marks from spreadsheet headers
     const headers = Object.keys(rawData[0] || {});
-    let parsedMaxMarks = 749; // default fallback
+    let parsedMaxMarks = 749;
+    let roundMaxMarksSum = 0;
+
     for (const header of headers) {
-      if (header.toLowerCase().includes('total') && header.includes('for')) {
-        const match = header.match(/for\s+(\d+)/i);
+      const hLower = header.toLowerCase();
+      if (hLower.includes('total') || hLower.includes('aggregate')) {
+        const match = header.match(/for\s+(\d+)/i) || header.match(/\((\d+)\s*marks?\)/i) || header.match(/\((\d+)\)/);
         if (match && match[1]) {
           parsedMaxMarks = Number(match[1]);
           break;
         }
       }
+      const roundMatch = header.match(/\((\d+)\s*marks?\)/i) || header.match(/\((\d+)\)/);
+      if (roundMatch && roundMatch[1]) {
+        roundMaxMarksSum += Number(roundMatch[1]);
+      }
     }
 
-    // 3. Process rows and try matching automatically
+    if (roundMaxMarksSum > 0 && parsedMaxMarks === 749) {
+      parsedMaxMarks = roundMaxMarksSum;
+    }
+
+    // 3. Process rows and match by Roll Number first
     const parsedRows = [];
     const matchedStudentIds = new Set();
 
     rawData.forEach((row, index) => {
       const parsedData = parseExcelRow(row);
-      if (!parsedData.studentEmail && !parsedData.studentName) return; // skip junk rows
+      if (!parsedData.studentEmail && !parsedData.studentName && !parsedData.rollNumber) return;
 
       let matchedStudent = null;
-      const normalizedEmail = parsedData.studentEmail.toLowerCase();
-      const rollPrefix = normalizedEmail.split('@')[0].trim();
+      const cleanRoll = (parsedData.rollNumber || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const normalizedEmail = (parsedData.studentEmail || '').toLowerCase().trim();
+      const rollFromEmail = normalizedEmail.split('@')[0].replace(/[^a-z0-9]/g, '');
 
-      // Attempt matching:
-      // a. Match by exact email
-      matchedStudent = students.find(s => s.email.toLowerCase() === normalizedEmail);
-
-      // b. Match by roll number prefix
-      if (!matchedStudent && rollPrefix) {
-        matchedStudent = students.find(s => s.rollNumber && s.rollNumber.toLowerCase() === rollPrefix);
+      // Priority 1: Match by exact / cleaned rollNumber (USN)
+      if (cleanRoll) {
+        matchedStudent = students.find(s => s.rollNumber && s.rollNumber.toLowerCase().replace(/[^a-z0-9]/g, '') === cleanRoll);
       }
 
-      // c. Match by studentName (normalized spaces and case)
+      // Priority 2: Match by email prefix
+      if (!matchedStudent && rollFromEmail) {
+        matchedStudent = students.find(s => s.rollNumber && s.rollNumber.toLowerCase().replace(/[^a-z0-9]/g, '') === rollFromEmail);
+      }
+
+      // Priority 3: Match by student email
+      if (!matchedStudent && normalizedEmail) {
+        matchedStudent = students.find(s => s.email && s.email.toLowerCase().trim() === normalizedEmail);
+      }
+
+      // Priority 4: Match by studentName
       if (!matchedStudent && parsedData.studentName) {
         const normalizeName = (val) => val ? val.toLowerCase().replace(/\s+/g, ' ').trim() : '';
         const normSearch = normalizeName(parsedData.studentName);
@@ -157,7 +260,6 @@ const parseMockDriveExcel = async (req, res) => {
       });
     });
 
-    // Find students in the database batch who were NOT matched automatically
     const unmatchedStudents = students.filter(s => !matchedStudentIds.has(s._id.toString())).map(s => ({
       _id: s._id,
       name: s.name,
@@ -172,6 +274,115 @@ const parseMockDriveExcel = async (req, res) => {
       maxMarks: parsedMaxMarks
     });
   } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Parse Google Sheet link and match students in the batch
+// @route   POST /api/mock-drives/parse-google-sheet
+// @access  Private/Admin/Mentor
+const parseMockDriveGoogleSheet = async (req, res) => {
+  try {
+    const { batchId, googleSheetUrl } = req.body;
+    if (!batchId) return res.status(400).json({ message: 'Batch ID is required' });
+    if (!googleSheetUrl) return res.status(400).json({ message: 'Google Sheet link is required' });
+
+    const csvUrl = convertGoogleSheetUrlToCsvUrl(googleSheetUrl);
+    if (!csvUrl) return res.status(400).json({ message: 'Invalid Google Sheet link' });
+
+    const csvBuffer = await fetchCsvFromUrl(csvUrl);
+    const wb = xlsx.read(csvBuffer, { type: 'buffer' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rawData = xlsx.utils.sheet_to_json(ws);
+
+    if (!rawData || rawData.length === 0) {
+      return res.status(400).json({ message: 'Google Sheet appears to be empty or unreadable' });
+    }
+
+    const headers = Object.keys(rawData[0] || {});
+    let parsedMaxMarks = 749;
+    let roundMaxMarksSum = 0;
+
+    for (const header of headers) {
+      const hLower = header.toLowerCase();
+      if (hLower.includes('total') || hLower.includes('aggregate')) {
+        const match = header.match(/for\s+(\d+)/i) || header.match(/\((\d+)\s*marks?\)/i) || header.match(/\((\d+)\)/);
+        if (match && match[1]) {
+          parsedMaxMarks = Number(match[1]);
+          break;
+        }
+      }
+      const roundMatch = header.match(/\((\d+)\s*marks?\)/i) || header.match(/\((\d+)\)/);
+      if (roundMatch && roundMatch[1]) {
+        roundMaxMarksSum += Number(roundMatch[1]);
+      }
+    }
+
+    if (roundMaxMarksSum > 0 && parsedMaxMarks === 749) {
+      parsedMaxMarks = roundMaxMarksSum;
+    }
+
+    const enrollments = await Enrollment.find({ batchId, status: 'approved' }).populate('studentId', 'name email rollNumber');
+    const students = enrollments.map(e => e.studentId).filter(s => s !== null);
+
+    const parsedRows = [];
+    const matchedStudentIds = new Set();
+
+    rawData.forEach((row, index) => {
+      const parsedData = parseExcelRow(row);
+      if (!parsedData.studentEmail && !parsedData.studentName && !parsedData.rollNumber) return;
+
+      let matchedStudent = null;
+      const cleanRoll = (parsedData.rollNumber || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const normalizedEmail = (parsedData.studentEmail || '').toLowerCase().trim();
+      const rollFromEmail = normalizedEmail.split('@')[0].replace(/[^a-z0-9]/g, '');
+
+      if (cleanRoll) {
+        matchedStudent = students.find(s => s.rollNumber && s.rollNumber.toLowerCase().replace(/[^a-z0-9]/g, '') === cleanRoll);
+      }
+      if (!matchedStudent && rollFromEmail) {
+        matchedStudent = students.find(s => s.rollNumber && s.rollNumber.toLowerCase().replace(/[^a-z0-9]/g, '') === rollFromEmail);
+      }
+      if (!matchedStudent && normalizedEmail) {
+        matchedStudent = students.find(s => s.email && s.email.toLowerCase().trim() === normalizedEmail);
+      }
+      if (!matchedStudent && parsedData.studentName) {
+        const normalizeName = (val) => val ? val.toLowerCase().replace(/\s+/g, ' ').trim() : '';
+        const normSearch = normalizeName(parsedData.studentName);
+        matchedStudent = students.find(s => normalizeName(s.name) === normSearch);
+      }
+
+      if (matchedStudent) {
+        matchedStudentIds.add(matchedStudent._id.toString());
+      }
+
+      parsedRows.push({
+        id: index,
+        rowData: parsedData,
+        matchedStudent: matchedStudent ? {
+          _id: matchedStudent._id,
+          name: matchedStudent.name,
+          email: matchedStudent.email,
+          rollNumber: matchedStudent.rollNumber
+        } : null
+      });
+    });
+
+    const unmatchedStudents = students.filter(s => !matchedStudentIds.has(s._id.toString())).map(s => ({
+      _id: s._id,
+      name: s.name,
+      email: s.email,
+      rollNumber: s.rollNumber
+    }));
+
+    res.json({
+      message: 'Google Sheet parsed successfully',
+      rows: parsedRows,
+      unmatchedStudents,
+      maxMarks: parsedMaxMarks
+    });
+  } catch (error) {
+    console.error('Error parsing Google Sheet:', error);
     res.status(500).json({ message: error.message });
   }
 };
@@ -443,6 +654,7 @@ const updateMockDrive = async (req, res) => {
 
 module.exports = {
   parseMockDriveExcel,
+  parseMockDriveGoogleSheet,
   saveMockDrive,
   getMockDrivesByBatch,
   getStudentMockDriveScores,

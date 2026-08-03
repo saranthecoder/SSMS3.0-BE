@@ -7,6 +7,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const {
   parseMockDriveExcel,
+  parseMockDriveGoogleSheet,
   saveMockDrive,
   getMockDrivesByBatch,
   getStudentMockDriveScores,
@@ -18,6 +19,7 @@ const {
 const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
 
 router.post('/parse-excel', protect, mentorOrAdmin, upload.single('file'), parseMockDriveExcel);
+router.post('/parse-google-sheet', protect, mentorOrAdmin, parseMockDriveGoogleSheet);
 router.post('/', protect, mentorOrAdmin, saveMockDrive);
 router.get('/batch/:batchId', protect, getMockDrivesByBatch);
 router.get('/student/:studentId', protect, getStudentMockDriveScores);
