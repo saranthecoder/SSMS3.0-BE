@@ -38,7 +38,7 @@ const createBatch = async (req, res) => {
     } = req.body;
 
     const assignedMentorId = mentorId || (req.user && req.user.role === 'mentor' ? req.user._id : null);
-    const effOnsiteMin = onsiteMinHours !== undefined ? Number(onsiteMinHours) : (requiredPresentHours !== undefined ? Number(requiredPresentHours) : 8);
+    const effOnsiteMin = onsiteMinHours !== undefined ? Number(onsiteMinHours) : (requiredPresentHours !== undefined ? Number(requiredPresentHours) : 4);
     const effOnsiteMax = onsiteMaxHours !== undefined ? Number(onsiteMaxHours) : (maxValidHours !== undefined ? Number(maxValidHours) : 10);
     const effWfhMin = wfhMinHours !== undefined ? Number(wfhMinHours) : effOnsiteMin;
     const effWfhMax = wfhMaxHours !== undefined ? Number(wfhMaxHours) : effOnsiteMax;
@@ -59,8 +59,8 @@ const createBatch = async (req, res) => {
       wfhMinHours: effWfhMin,
       wfhMaxHours: effWfhMax,
       checkInTime: checkInTime || '09:00',
-      checkOutTime: checkOutTime || '17:00',
-      autoCheckOutTime: autoCheckOutTime || '21:00',
+      checkOutTime: checkOutTime || '23:59',
+      autoCheckOutTime: autoCheckOutTime || '23:59',
       autoCheckOutEnabled: autoCheckOutEnabled !== undefined ? Boolean(autoCheckOutEnabled) : true
     });
 
@@ -374,20 +374,20 @@ const getBatchReport = async (req, res) => {
         const date = uniqueDates[i];
         const record = attendanceByStudentDateMap.get(`${sId}_${date}`);
         if (record) {
-          if ((record.isLeave || record.status === 'Leave') && (record.leaveHours || 0) === 0) {
+          const hours = (record.sessionDurationSeconds || 0) / 3600;
+          const minRequired = (record.isLeave && record.leaveHours > 0)
+            ? Math.max(1, reqHours - record.leaveHours)
+            : reqHours;
+          if (record.status === 'Present' || (hours >= minRequired && hours <= maxHours)) {
+            presentCount++;
+          } else if (record.status === 'Invalid' || hours > maxHours) {
+            invalidCount++;
+          } else if (record.isActive) {
+            inProgressCount++;
+          } else if (record.isLeave || record.status === 'Leave') {
             leaveCount++;
           } else {
-            const hours = (record.sessionDurationSeconds || 0) / 3600;
-            const minRequired = reqHours - (record.leaveHours || 0);
-            if (hours >= minRequired && hours <= maxHours) {
-              presentCount++;
-            } else if (hours > maxHours) {
-              invalidCount++;
-            } else if (record.isActive) {
-              inProgressCount++;
-            } else {
-              absentCount++;
-            }
+            absentCount++;
           }
         } else {
           absentCount++;
@@ -458,20 +458,20 @@ const getBatchReport = async (req, res) => {
         const record = attendanceByStudentDateMap.get(`${sId}_${dateStr}`);
         let status = 'Absent';
         if (record) {
-          if ((record.isLeave || record.status === 'Leave') && (record.leaveHours || 0) === 0) {
+          const hours = (record.sessionDurationSeconds || 0) / 3600;
+          const minRequired = (record.isLeave && record.leaveHours > 0)
+            ? Math.max(1, reqHours - record.leaveHours)
+            : reqHours;
+          if (record.status === 'Present' || (hours >= minRequired && hours <= maxHours)) {
+            status = 'Present';
+          } else if (record.status === 'Invalid' || hours > maxHours) {
+            status = 'Invalid';
+          } else if (record.isActive) {
+            status = 'In Progress';
+          } else if (record.isLeave || record.status === 'Leave') {
             status = 'Leave';
           } else {
-            const hours = (record.sessionDurationSeconds || 0) / 3600;
-            const minRequired = reqHours - (record.leaveHours || 0);
-            if (hours >= minRequired && hours <= maxHours) {
-              status = 'Present';
-            } else if (hours > maxHours) {
-              status = 'Invalid';
-            } else if (record.isActive) {
-              status = 'In Progress';
-            } else {
-              status = 'Absent';
-            }
+            status = 'Absent';
           }
         }
 

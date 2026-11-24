@@ -26,6 +26,30 @@ const attendanceSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  onsiteDurationSeconds: {
+    type: Number,
+    default: 0
+  },
+  wfhDurationSeconds: {
+    type: Number,
+    default: 0
+  },
+  onsiteMinHours: {
+    type: Number,
+    default: 4
+  },
+  onsiteMaxHours: {
+    type: Number,
+    default: 10
+  },
+  wfhMinHours: {
+    type: Number,
+    default: 4
+  },
+  wfhMaxHours: {
+    type: Number,
+    default: 10
+  },
   accessType: {
     type: String,
     enum: ['on-site', 'wfh'],
@@ -37,7 +61,7 @@ const attendanceSchema = new mongoose.Schema({
   },
   minRequiredHours: {
     type: Number,
-    default: 8
+    default: 4
   },
   maxValidHours: {
     type: Number,

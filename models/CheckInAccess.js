@@ -18,15 +18,15 @@ const checkInAccessSchema = new mongoose.Schema({
   },
   workHours: {
     type: Number,
-    default: null // Mentor day-wise specified work hours
+    default: 4 // Mentor day-wise specified work hours (default 4h)
   },
   minHours: {
     type: Number,
-    default: null
+    default: 4
   },
   maxHours: {
     type: Number,
-    default: null
+    default: 10
   },
   grantedBy: {
     type: mongoose.Schema.Types.ObjectId,

@@ -5,6 +5,26 @@ const Enrollment = require('../models/Enrollment');
 const socketHandlers = require('../sockets/socketHandlers');
 const { invalidateStudentAnalyticsCache } = require('./analyticsController');
 
+const parseToUTC = (dateInput) => {
+  if (!dateInput) return null;
+  if (dateInput instanceof Date) return dateInput;
+  if (typeof dateInput === 'string') {
+    // If it already has Z or timezone offset (+HH:MM / -HH:MM), parse directly
+    if (dateInput.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(dateInput)) {
+      return new Date(dateInput);
+    }
+    // If it's a naive local datetime string from Indian clients (e.g. YYYY-MM-DDTHH:mm or YYYY-MM-DDTHH:mm:ss), treat as IST (+05:30)
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(dateInput)) {
+      return new Date(`${dateInput}+05:30`);
+    }
+    // If it's just a date (YYYY-MM-DD), default to end of day in IST (23:59:59 IST = 18:29:59 UTC)
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateInput)) {
+      return new Date(`${dateInput}T23:59:59+05:30`);
+    }
+  }
+  return new Date(dateInput);
+};
+
 // @desc    Create a task
 // @route   POST /api/tasks
 // @access  Private/Admin
@@ -19,11 +39,11 @@ const createTask = async (req, res) => {
       fileUrl,
       linkUrl,
       category: category || 'General',
-      dueDate,
+      dueDate: parseToUTC(dueDate),
       maxMarks,
       batchId,
       createdBy: req.user._id,
-      scheduledAt: scheduledAt || null,
+      scheduledAt: parseToUTC(scheduledAt),
       requiredLinks: requiredLinks || []
     });
 
@@ -167,7 +187,15 @@ const getTaskById = async (req, res) => {
 // @access  Private/Admin
 const updateTask = async (req, res) => {
   try {
-    const task = await Task.findByIdAndUpdate(req.params.id, req.body, {
+    const updateData = { ...req.body };
+    if (updateData.dueDate !== undefined) {
+      updateData.dueDate = parseToUTC(updateData.dueDate);
+    }
+    if (updateData.scheduledAt !== undefined) {
+      updateData.scheduledAt = parseToUTC(updateData.scheduledAt);
+    }
+
+    const task = await Task.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
       runValidators: true
     });

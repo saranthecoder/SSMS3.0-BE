@@ -39,9 +39,13 @@ const createSyllabusEntry = async (req, res) => {
       return res.status(404).json({ message: 'Batch not found' });
     }
 
-    // If caller is mentor, verify they are assigned to this batch
-    if (req.user.role === 'mentor' && batch.mentorId && batch.mentorId.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'You are not assigned to this batch' });
+    // If caller is mentor, verify they are assigned to this batch (lead or co-mentor)
+    if (req.user.role === 'mentor') {
+      const isLead = batch.mentorId && batch.mentorId.toString() === req.user._id.toString();
+      const isCoMentor = Array.isArray(batch.mentors) && batch.mentors.some(m => m.toString() === req.user._id.toString());
+      if (!isLead && !isCoMentor) {
+        return res.status(403).json({ message: 'You are not assigned to this batch' });
+      }
     }
 
     // Format subtopics if string was passed
@@ -127,7 +131,12 @@ const getSyllabusEntries = async (req, res) => {
       if (batchId) {
         query.batchId = batchId;
       } else {
-        const mentorBatches = await Batch.find({ mentorId: req.user._id }).select('_id').lean();
+        const mentorBatches = await Batch.find({
+          $or: [
+            { mentorId: req.user._id },
+            { mentors: req.user._id }
+          ]
+        }).select('_id').lean();
         const batchIds = mentorBatches.map(b => b._id);
         query.batchId = { $in: batchIds };
       }

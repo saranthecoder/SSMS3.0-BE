@@ -256,9 +256,11 @@ const autoEvaluateSubmissions = async (req, res) => {
 
       const submissionDate = new Date(submission.submittedAt || submission.createdAt);
       
-      // Set dueDate to 23:59:59 of that day
+      // Use task's exact deadline; only default legacy dates at midnight to 23:59:59
       const dueDate = new Date(task.dueDate);
-      dueDate.setHours(23, 59, 59, 999);
+      if (dueDate.getHours() === 0 && dueDate.getMinutes() === 0 && dueDate.getSeconds() === 0) {
+        dueDate.setHours(23, 59, 59, 999);
+      }
 
       let marksObtained = task.maxMarks;
       let feedback = 'Full marks. Submitted on time.';

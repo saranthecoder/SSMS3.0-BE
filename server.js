@@ -288,32 +288,20 @@ cron.schedule('0 0 * * *', async () => {
       dateStr: { $lt: todayStr }
     });
 
+    const { evaluateAttendanceRecord } = require('./controllers/attendanceController');
+
     for (const record of activeRecords) {
+      let elapsedSec = 0;
       if (record.isActive) {
         // Since cron runs exactly at midnight, use 'now' as the cutoff
         const durationMs = now.getTime() - new Date(record.lastCheckInTime).getTime();
-        record.sessionDurationSeconds += Math.floor(durationMs / 1000);
+        elapsedSec = Math.max(0, Math.floor(durationMs / 1000));
         record.checkOutTime = now;
         record.isActive = false;
       }
 
-      // Compute final status for the past day
-      if (record.isLeave && (record.leaveHours || 0) === 0) {
-        record.status = 'Leave';
-      } else {
-        const { getBatchHourLimits } = require('./controllers/attendanceController');
-        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(record.studentId, record.dateStr, record.accessType);
-        const hours = (record.sessionDurationSeconds || 0) / 3600;
-        const minRequired = requiredPresentHours - (record.leaveHours || 0);
-        if (hours >= minRequired && hours <= maxValidHours) {
-          record.status = 'Present';
-        } else if (hours > maxValidHours) {
-          record.status = 'Invalid';
-        } else {
-          record.status = 'Absent';
-        }
-      }
-
+      // Compute final status for the past day maintaining On-Site and WFH records separately
+      evaluateAttendanceRecord(record, elapsedSec);
       await record.save();
     }
   });

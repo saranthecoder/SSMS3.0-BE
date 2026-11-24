@@ -1,4 +1,5 @@
 const CheckInAccess = require('../models/CheckInAccess');
+const Leave = require('../models/Leave');
 
 const getISTDateStr = (date = new Date()) => {
   const istTime = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
@@ -30,19 +31,57 @@ const grantAccess = async (req, res) => {
 
     const dateStr = getISTDateStr();
 
-    const updateData = { accessType: type, grantedBy: req.user._id };
-    if (workHours !== undefined && workHours !== null && workHours !== '') {
-      updateData.workHours = Number(workHours);
-      updateData.minHours = Number(workHours);
-    }
-    if (minHours !== undefined && minHours !== null && minHours !== '') {
-      updateData.minHours = Number(minHours);
-    }
-    if (maxHours !== undefined && maxHours !== null && maxHours !== '') {
-      updateData.maxHours = Number(maxHours);
+    // Check for approved leaves for the requested students today
+    const approvedLeaves = await Leave.find({
+      studentId: { $in: studentIds },
+      status: 'approved',
+      $or: [
+        { startDate: dateStr },
+        { 
+          leaveType: 'multiple_days',
+          startDate: { $lte: dateStr },
+          endDate: { $gte: dateStr }
+        }
+      ]
+    }).lean();
+
+    const leaveStudentIds = new Set(approvedLeaves.map(l => l.studentId.toString()));
+    let targetStudentIds = studentIds;
+
+    // Students on approved leave are restricted from on-site check-in; only WFH can be allocated
+    if (type === 'on-site' && leaveStudentIds.size > 0) {
+      if (studentIds.length === 1) {
+        return res.status(400).json({ 
+          message: 'Student is on approved leave today. On-site access is not allowed; only WFH access can be allocated.' 
+        });
+      }
+      targetStudentIds = studentIds.filter(id => !leaveStudentIds.has(id.toString()));
+      if (targetStudentIds.length === 0) {
+        return res.status(400).json({ 
+          message: 'All selected students are on approved leave today. Only WFH access can be allocated to students on leave.' 
+        });
+      }
     }
 
-    const promises = studentIds.map(studentId => 
+    const effWorkHours = (workHours !== undefined && workHours !== null && workHours !== '') 
+      ? Number(workHours) 
+      : 4;
+    const effMinHours = (minHours !== undefined && minHours !== null && minHours !== '') 
+      ? Number(minHours) 
+      : effWorkHours;
+    const effMaxHours = (maxHours !== undefined && maxHours !== null && maxHours !== '') 
+      ? Number(maxHours) 
+      : 10;
+
+    const updateData = { 
+      accessType: type, 
+      grantedBy: req.user._id,
+      workHours: effWorkHours,
+      minHours: effMinHours,
+      maxHours: effMaxHours
+    };
+
+    const promises = targetStudentIds.map(studentId => 
       CheckInAccess.findOneAndUpdate(
         { studentId, batchId, dateStr },
         updateData,
@@ -52,7 +91,13 @@ const grantAccess = async (req, res) => {
 
     await Promise.all(promises);
 
-    res.status(200).json({ message: 'Access granted successfully.' });
+    const skippedCount = studentIds.length - targetStudentIds.length;
+    let message = 'Access granted successfully.';
+    if (skippedCount > 0) {
+      message = `Access granted to ${targetStudentIds.length} student(s). ${skippedCount} student(s) on approved leave were skipped for On-Site (WFH must be allocated for them).`;
+    }
+
+    res.status(200).json({ message, grantedCount: targetStudentIds.length, skippedCount });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -98,12 +143,36 @@ const getTodayAccess = async (req, res) => {
       query.batchId = batchId;
     }
 
-    const grants = await CheckInAccess.find(query)
-      .populate('studentId', 'name email rollNumber')
-      .populate('grantedBy', 'name')
-      .populate('batchId', 'batchName');
+    const [grants, leaves] = await Promise.all([
+      CheckInAccess.find(query)
+        .populate('studentId', 'name email rollNumber')
+        .populate('grantedBy', 'name')
+        .populate('batchId', 'batchName')
+        .lean(),
+      Leave.find({
+        status: 'approved',
+        $or: [
+          { startDate: dateStr },
+          { 
+            leaveType: 'multiple_days',
+            startDate: { $lte: dateStr },
+            endDate: { $gte: dateStr }
+          }
+        ]
+      }).select('studentId reason leaveType startDate endDate').lean()
+    ]);
 
-    res.status(200).json(grants);
+    const leavesMap = {};
+    leaves.forEach(l => {
+      leavesMap[l.studentId.toString()] = l;
+    });
+
+    const enrichedGrants = grants.map(g => ({
+      ...g,
+      isLeave: Boolean(g.studentId && leavesMap[g.studentId._id ? g.studentId._id.toString() : g.studentId.toString()])
+    }));
+
+    res.status(200).json({ grants: enrichedGrants, leaves });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -117,28 +186,49 @@ const getMyStatus = async (req, res) => {
     const Enrollment = require('../models/Enrollment');
     const dateStr = getISTDateStr();
 
+    // Resolve student's enrolled batch(es) to check batch attendance policies
+    const myEnrollments = await Enrollment.find({ studentId: req.user._id, status: 'approved' }).populate('batchId').lean();
+    const activeEnrollments = myEnrollments.filter(e => e.batchId && e.batchId.status === 'Active');
+    const primaryBatch = activeEnrollments.length > 0 ? activeEnrollments[0].batchId : (myEnrollments[0]?.batchId || null);
+
+    const policy = {
+      onsiteMinHours: primaryBatch?.onsiteMinHours !== undefined ? Number(primaryBatch.onsiteMinHours) : 4,
+      onsiteMaxHours: primaryBatch?.onsiteMaxHours !== undefined ? Number(primaryBatch.onsiteMaxHours) : 10,
+      wfhMinHours: primaryBatch?.wfhMinHours !== undefined ? Number(primaryBatch.wfhMinHours) : 4,
+      wfhMaxHours: primaryBatch?.wfhMaxHours !== undefined ? Number(primaryBatch.wfhMaxHours) : 10,
+      checkInTime: primaryBatch?.checkInTime || '09:00',
+      checkOutTime: primaryBatch?.checkOutTime || '23:59',
+      batchName: primaryBatch?.batchName || ''
+    };
+
     const grants = await CheckInAccess.find({ studentId: req.user._id, dateStr });
 
     if (grants.length === 0) {
-      return res.status(200).json({ hasAccess: false });
+      return res.status(200).json({ 
+        hasAccess: false,
+        policy,
+        minHours: policy.onsiteMinHours,
+        maxHours: policy.onsiteMaxHours
+      });
     }
 
-    // Resolve student's enrolled batch(es) to check if they have WFH for their batch
-    const myEnrollments = await Enrollment.find({ studentId: req.user._id, status: 'approved' });
-    const activeBatchIds = myEnrollments.map(e => e.batchId.toString());
-
-    // Filter grants that match their active batches and prioritize wfh
+    const activeBatchIds = myEnrollments.map(e => e.batchId?._id?.toString() || e.batchId?.toString()).filter(Boolean);
     const activeGrants = grants.filter(g => g.batchId && activeBatchIds.includes(g.batchId.toString()));
     const primaryGrant = activeGrants.length > 0 
       ? (activeGrants.find(g => g.accessType === 'wfh') || activeGrants[0]) 
       : grants[0];
 
+    const isWfh = primaryGrant.accessType === 'wfh';
+    const effMin = primaryGrant.minHours || primaryGrant.workHours || (isWfh ? policy.wfhMinHours : policy.onsiteMinHours);
+    const effMax = primaryGrant.maxHours || (isWfh ? policy.wfhMaxHours : policy.onsiteMaxHours);
+
     res.status(200).json({
       hasAccess: true,
       accessType: primaryGrant.accessType,
-      workHours: primaryGrant.workHours || primaryGrant.minHours || null,
-      minHours: primaryGrant.minHours || null,
-      maxHours: primaryGrant.maxHours || null,
+      workHours: primaryGrant.workHours || effMin,
+      minHours: effMin,
+      maxHours: effMax,
+      policy,
       grantedAt: primaryGrant.createdAt,
       grants: grants.map(g => ({ 
         batchId: g.batchId, 

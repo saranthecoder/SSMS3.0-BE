@@ -37,15 +37,15 @@ const batchSchema = new mongoose.Schema({
   },
   checkInTime: {
     type: String, // format "HH:MM" e.g., "09:00"
-    default: ''
+    default: '09:00'
   },
   checkOutTime: {
-    type: String, // format "HH:MM" e.g., "18:00"
-    default: ''
+    type: String, // format "HH:MM" e.g., "23:59"
+    default: '23:59'
   },
   autoCheckOutTime: {
-    type: String, // format "HH:MM" e.g., "21:00"
-    default: '21:00'
+    type: String, // format "HH:MM" e.g., "23:59"
+    default: '23:59'
   },
   autoCheckOutEnabled: {
     type: Boolean,
@@ -58,7 +58,7 @@ const batchSchema = new mongoose.Schema({
   },
   requiredPresentHours: {
     type: Number,
-    default: 8
+    default: 4
   },
   maxValidHours: {
     type: Number,
@@ -66,7 +66,7 @@ const batchSchema = new mongoose.Schema({
   },
   onsiteMinHours: {
     type: Number,
-    default: 8
+    default: 4
   },
   onsiteMaxHours: {
     type: Number,
@@ -74,7 +74,7 @@ const batchSchema = new mongoose.Schema({
   },
   wfhMinHours: {
     type: Number,
-    default: 8
+    default: 4
   },
   wfhMaxHours: {
     type: Number,
