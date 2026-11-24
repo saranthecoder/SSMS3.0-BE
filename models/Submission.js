@@ -56,6 +56,10 @@ const submissionSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  coinsAwarded: {
+    type: Number,
+    default: 0
+  },
   submittedLinks: [{
     label: { type: String, required: true },
     url: { type: String, required: false }

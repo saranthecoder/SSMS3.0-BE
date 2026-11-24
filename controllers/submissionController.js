@@ -1,5 +1,9 @@
 const Submission = require('../models/Submission');
 const Task = require('../models/Task');
+const User = require('../models/User');
+const GamificationEvent = require('../models/GamificationEvent');
+const { awardCoinsWithCap, checkAndAwardBadges } = require('../utils/gamification');
+const socketHandlers = require('../sockets/socketHandlers');
 const { invalidateStudentAnalyticsCache } = require('./analyticsController');
 
 // @desc    Submit a task
@@ -35,8 +39,49 @@ const submitTask = async (req, res) => {
       }
     }
 
+    // Calculate 10x allocated marks for gamification coins
+    const taskMarks = Number(task.maxMarks) || 0;
+    const coinsToAward = Math.round(taskMarks * 10);
+
     if (submissionExists) {
       if (submissionExists.status === 'resubmit') {
+        let coinsGivenOnResubmit = 0;
+        // If not previously awarded coins for this task, award now
+        if (!submissionExists.coinsAwarded && coinsToAward > 0) {
+          const studentUser = await User.findById(req.user._id);
+          if (studentUser) {
+            coinsGivenOnResubmit = awardCoinsWithCap(
+              studentUser,
+              coinsToAward,
+              `Task Submission: "${task.title}" (10x ${taskMarks} marks)`,
+              true
+            );
+            checkAndAwardBadges(studentUser);
+            await studentUser.save();
+
+            await GamificationEvent.create({
+              userId: studentUser._id,
+              eventType: 'coins_earned',
+              coinsChange: coinsGivenOnResubmit,
+              xpChange: 0,
+              reason: `Task Submission: "${task.title}" (10x ${taskMarks} marks)`,
+              metadata: { taskId: task._id, taskTitle: task.title, maxMarks: taskMarks, coinsAwarded: coinsGivenOnResubmit }
+            });
+
+            try {
+              socketHandlers.emitToUser(studentUser._id.toString(), 'coins-received', {
+                sender: { name: 'SSMS Tasks' },
+                amount: coinsGivenOnResubmit,
+                newCoins: studentUser.coins,
+                reason: `Earned ${coinsGivenOnResubmit} gamification coins for submitting "${task.title}"!`
+              });
+            } catch (sockErr) {
+              console.warn('Real-time coins-received socket warning:', sockErr.message);
+            }
+          }
+          submissionExists.coinsAwarded = coinsGivenOnResubmit;
+        }
+
         // Update existing submission
         submissionExists.submissionType = submissionType;
         submissionExists.textContent = textContent;
@@ -54,9 +99,55 @@ const submitTask = async (req, res) => {
         
         await submissionExists.save();
         invalidateStudentAnalyticsCache(req.user._id);
-        return res.status(200).json(submissionExists);
+        return res.status(200).json({
+          ...submissionExists.toObject(),
+          coinsAwarded: coinsGivenOnResubmit || submissionExists.coinsAwarded || 0,
+          taskMarks
+        });
       } else {
         return res.status(400).json({ message: 'Task already submitted. Cannot resubmit.' });
+      }
+    }
+
+    // Award 10x marks into student's gamification coins
+    let actualCoinsAwarded = 0;
+    if (coinsToAward > 0) {
+      const studentUser = await User.findById(req.user._id);
+      if (studentUser) {
+        actualCoinsAwarded = awardCoinsWithCap(
+          studentUser,
+          coinsToAward,
+          `Task Submission: "${task.title}" (10x ${taskMarks} marks)`,
+          true
+        );
+        checkAndAwardBadges(studentUser);
+        await studentUser.save();
+
+        await GamificationEvent.create({
+          userId: studentUser._id,
+          eventType: 'coins_earned',
+          coinsChange: actualCoinsAwarded,
+          xpChange: 0,
+          reason: `Task Submission: "${task.title}" (10x ${taskMarks} marks)`,
+          metadata: {
+            taskId: task._id,
+            taskTitle: task.title,
+            maxMarks: taskMarks,
+            coinsAwarded: actualCoinsAwarded
+          }
+        });
+
+        // Real-time socket notification to the student
+        try {
+          socketHandlers.emitToUser(studentUser._id.toString(), 'coins-received', {
+            sender: { name: 'SSMS Tasks' },
+            amount: actualCoinsAwarded,
+            newCoins: studentUser.coins,
+            reason: `Earned ${actualCoinsAwarded} gamification coins for submitting "${task.title}"!`
+          });
+        } catch (sockErr) {
+          console.warn('Real-time coins-received socket warning:', sockErr.message);
+        }
       }
     }
 
@@ -74,12 +165,17 @@ const submitTask = async (req, res) => {
       isLate,
       delayHours,
       latePenalty,
-      submittedLinks: submittedLinks || []
+      submittedLinks: submittedLinks || [],
+      coinsAwarded: actualCoinsAwarded
     });
 
     invalidateStudentAnalyticsCache(req.user._id);
 
-    res.status(201).json(submission);
+    res.status(201).json({
+      ...submission.toObject(),
+      coinsAwarded: actualCoinsAwarded,
+      taskMarks
+    });
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
