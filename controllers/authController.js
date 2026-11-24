@@ -224,7 +224,12 @@ const updateUserProfile = async (req, res) => {
     if (user) {
       user.name = req.body.name || user.name;
       user.phone = req.body.phone !== undefined ? req.body.phone : user.phone;
-      user.rollNumber = req.body.rollNumber !== undefined ? req.body.rollNumber : user.rollNumber;
+
+      // Roll Number is the permanent primary key for students - prevent mutation by students
+      if (user.role !== 'student' && req.body.rollNumber !== undefined) {
+        user.rollNumber = req.body.rollNumber;
+      }
+
       user.github = req.body.github !== undefined ? req.body.github : user.github;
       user.linkedin = req.body.linkedin !== undefined ? req.body.linkedin : user.linkedin;
       user.portfolio = req.body.portfolio !== undefined ? req.body.portfolio : user.portfolio;
@@ -233,6 +238,10 @@ const updateUserProfile = async (req, res) => {
       
       if (req.body.email && req.body.email.trim() !== '') {
         const newEmail = req.body.email.toLowerCase().trim();
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(newEmail)) {
+          return res.status(400).json({ message: 'Please provide a valid email address.' });
+        }
         if (newEmail !== user.email) {
           const emailExists = await User.findOne({ email: newEmail, _id: { $ne: user._id } });
           if (emailExists) {
