@@ -240,7 +240,9 @@ const getStudentAnalytics = async (req, res) => {
           type: 'task',
           title: 'New Task Assigned',
           message: t.title,
-          time: t.createdAt
+          time: t.createdAt,
+          taskId: t._id,
+          taskTitle: t.title
         });
       });
 
@@ -251,7 +253,10 @@ const getStudentAnalytics = async (req, res) => {
           type: 'grade',
           title: `Task Graded: ${g.marksObtained}/${sub?.taskId?.maxMarks || 100}`,
           message: g.feedback || 'Review completed',
-          time: g.reviewedAt || g.createdAt
+          time: g.reviewedAt || g.createdAt,
+          submissionId: g.submissionId,
+          taskId: sub?.taskId?._id || sub?.taskId,
+          taskTitle: sub?.taskId?.title || ''
         });
       });
 
@@ -272,7 +277,10 @@ const getStudentAnalytics = async (req, res) => {
           type: 'warning',
           title: 'Re-submission Requested',
           message: `Admin requested re-submission for: ${fullSub?.taskId?.title || 'Task'}`,
-          time: s.updatedAt || s.createdAt
+          time: s.updatedAt || s.createdAt,
+          submissionId: s._id,
+          taskId: fullSub?.taskId?._id || fullSub?.taskId,
+          taskTitle: fullSub?.taskId?.title || ''
         });
       });
 
@@ -438,7 +446,9 @@ const getStudentAnalytics = async (req, res) => {
         type: 'task',
         title: 'New Task Assigned',
         message: t.title,
-        time: t.createdAt
+        time: t.createdAt,
+        taskId: t._id,
+        taskTitle: t.title
       });
     });
     latestGrades.forEach(g => {
@@ -448,7 +458,10 @@ const getStudentAnalytics = async (req, res) => {
         type: 'grade',
         title: `Task Graded: ${g.marksObtained}/${sub?.taskId?.maxMarks || 100}`,
         message: g.feedback || 'Review completed',
-        time: g.reviewedAt || g.createdAt
+        time: g.reviewedAt || g.createdAt,
+        submissionId: g.submissionId,
+        taskId: sub?.taskId?._id || sub?.taskId,
+        taskTitle: sub?.taskId?.title || ''
       });
     });
     resubmitSubmissions.forEach(s => {
@@ -457,7 +470,10 @@ const getStudentAnalytics = async (req, res) => {
         type: 'warning',
         title: 'Re-submission Requested',
         message: `Admin requested re-submission for: ${s.taskId?.title || 'Task'}`,
-        time: s.updatedAt || s.createdAt
+        time: s.updatedAt || s.createdAt,
+        submissionId: s._id,
+        taskId: s.taskId?._id || s.taskId,
+        taskTitle: s.taskId?.title || ''
       });
     });
 
@@ -793,7 +809,10 @@ const getAdminDashboardStats = async (req, res) => {
         type: 'task',
         title: `New Task Created`,
         message: `"${t.title}" assigned to ${t.batchId?.batchName || 'a batch'}`,
-        time: t.createdAt
+        time: t.createdAt,
+        taskId: t._id,
+        taskTitle: t.title,
+        batchId: t.batchId?._id || t.batchId
       });
     });
     latestSubs.forEach(s => {
@@ -802,27 +821,37 @@ const getAdminDashboardStats = async (req, res) => {
         type: 'submission',
         title: `New Submission`,
         message: `${s.studentId?.name || 'A student'} submitted "${s.taskId?.title || 'a task'}"`,
-        time: s.submittedAt || s.createdAt
+        time: s.submittedAt || s.createdAt,
+        submissionId: s._id,
+        taskId: s.taskId?._id || s.taskId,
+        taskTitle: s.taskId?.title || '',
+        studentName: s.studentId?.name || '',
+        batchId: s.taskId?.batchId || s.studentId?.batchId
       });
     });
     
     pendingLeaves.forEach(l => {
       notifications.push({
         id: 'pl_' + l._id,
-        type: 'warning',
+        type: 'leave',
         title: 'Leave Request Pending',
         message: `${l.studentId?.name || 'A student'} requested leave for ${new Date(l.date).toLocaleDateString()}`,
-        time: l.createdAt
+        time: l.createdAt,
+        leaveId: l._id,
+        studentName: l.studentId?.name
       });
     });
 
     pendingEnrollments.forEach(e => {
       notifications.push({
         id: 'jr_' + e._id,
-        type: 'warning',
+        type: 'enrollment',
         title: 'New Batch Join Request',
         message: `${e.studentId?.name || 'A student'} requested to join ${e.batchId?.batchName || 'a batch'}`,
-        time: e.createdAt
+        time: e.createdAt,
+        enrollmentId: e._id,
+        batchId: e.batchId?._id || e.batchId,
+        studentName: e.studentId?.name
       });
     });
 

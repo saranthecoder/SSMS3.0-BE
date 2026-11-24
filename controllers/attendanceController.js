@@ -81,8 +81,10 @@ const evaluateAttendanceRecord = (record, additionalSeconds = 0) => {
   if (additionalSeconds > 0) {
     if (currentAccessType === 'wfh') {
       record.wfhDurationSeconds = (record.wfhDurationSeconds || 0) + additionalSeconds;
+      record.wfhAllocated = true;
     } else {
       record.onsiteDurationSeconds = (record.onsiteDurationSeconds || 0) + additionalSeconds;
+      record.onsiteAllocated = true;
     }
   }
 
@@ -90,8 +92,10 @@ const evaluateAttendanceRecord = (record, additionalSeconds = 0) => {
   if ((!record.onsiteDurationSeconds && !record.wfhDurationSeconds) && (record.sessionDurationSeconds || 0) > 0) {
     if (currentAccessType === 'wfh') {
       record.wfhDurationSeconds = record.sessionDurationSeconds;
+      record.wfhAllocated = true;
     } else {
       record.onsiteDurationSeconds = record.sessionDurationSeconds;
+      record.onsiteAllocated = true;
     }
   }
 
@@ -99,33 +103,52 @@ const evaluateAttendanceRecord = (record, additionalSeconds = 0) => {
 
   const onsiteHrs = (record.onsiteDurationSeconds || 0) / 3600;
   const wfhHrs = (record.wfhDurationSeconds || 0) / 3600;
-  const totalHrs = (record.sessionDurationSeconds || 0) / 3600;
 
-  const onsiteMin = record.onsiteMinHours !== undefined ? record.onsiteMinHours : (record.minRequiredHours || 4);
-  const onsiteMax = record.onsiteMaxHours !== undefined ? record.onsiteMaxHours : (record.maxValidHours || 10);
-  const wfhMin = record.wfhMinHours !== undefined ? record.wfhMinHours : (record.minRequiredHours || 4);
-  const wfhMax = record.wfhMaxHours !== undefined ? record.wfhMaxHours : (record.maxValidHours || 10);
+  const onsiteMin = (record.onsiteMinHours !== undefined && Number(record.onsiteMinHours) > 0)
+    ? Number(record.onsiteMinHours)
+    : 4;
 
-  // Check over-time first: if total or either exceeds maximum allowed
-  if (onsiteHrs > onsiteMax || wfhHrs > wfhMax || totalHrs > Math.max(onsiteMax, wfhMax)) {
+  const wfhMin = (record.wfhMinHours !== undefined && Number(record.wfhMinHours) > 0)
+    ? Number(record.wfhMinHours)
+    : 4;
+
+  const onsiteMax = (record.onsiteMaxHours !== undefined && Number(record.onsiteMaxHours) > 0)
+    ? Number(record.onsiteMaxHours)
+    : (record.maxValidHours || 10);
+
+  const wfhMax = (record.wfhMaxHours !== undefined && Number(record.wfhMaxHours) > 0)
+    ? Number(record.wfhMaxHours)
+    : (record.maxValidHours || 10);
+
+  // Check over-time first: if either exceeds maximum allowed
+  if (onsiteHrs > onsiteMax || wfhHrs > wfhMax) {
     record.status = 'Invalid';
     return record.status;
   }
 
-  // Check workload satisfaction:
-  // Case 1: Student did work in both modes (onsite > 0 and wfh > 0)
-  if (record.onsiteDurationSeconds > 0 && record.wfhDurationSeconds > 0) {
-    const satisfiesBoth = (onsiteHrs >= onsiteMin) && (wfhHrs >= wfhMin);
-    const satisfiesCombined = (totalHrs >= Math.min(onsiteMin, wfhMin)) && (totalHrs <= Math.max(onsiteMax, wfhMax));
-    
-    if (satisfiesBoth || satisfiesCombined) {
+  // If still actively checked in, status remains 'In Progress'
+  if (record.isActive) {
+    record.status = 'In Progress';
+    return record.status;
+  }
+
+  // Determine which modes were allocated or undertaken
+  const hasOnsite = Boolean(record.onsiteAllocated || (record.onsiteDurationSeconds || 0) > 0);
+  const hasWfh = Boolean(record.wfhAllocated || (record.wfhDurationSeconds || 0) > 0);
+
+  // Case 1: Both On-Site and WFH were allocated or undertaken today
+  if (hasOnsite && hasWfh) {
+    const onsiteSatisfied = onsiteHrs >= onsiteMin;
+    const wfhSatisfied = wfhHrs >= wfhMin;
+
+    if (onsiteSatisfied && wfhSatisfied) {
       record.status = 'Present';
     } else {
       record.status = record.isLeave ? 'Leave' : 'Absent';
     }
-  } 
-  // Case 2: Only WFH recorded
-  else if (record.wfhDurationSeconds > 0) {
+  }
+  // Case 2: Holiday / WFH-only day (mentor only allocated WFH, no onsite expected)
+  else if (hasWfh && !hasOnsite) {
     const minReq = (record.isLeave && record.leaveHours > 0)
       ? Math.max(1, wfhMin - record.leaveHours)
       : wfhMin;
@@ -136,7 +159,7 @@ const evaluateAttendanceRecord = (record, additionalSeconds = 0) => {
       record.status = record.isLeave ? 'Leave' : 'Absent';
     }
   }
-  // Case 3: Only On-Site recorded
+  // Case 3: On-Site only day (mentor only allocated on-site, no WFH expected)
   else {
     const minReq = (record.isLeave && record.leaveHours > 0)
       ? Math.max(1, onsiteMin - record.leaveHours)
@@ -375,9 +398,11 @@ const checkIn = async (req, res) => {
         attendance.isLeave = true;
       }
       if (isWfh) {
+        attendance.wfhAllocated = true;
         attendance.wfhMinHours = minH;
         attendance.wfhMaxHours = maxH;
       } else {
+        attendance.onsiteAllocated = true;
         attendance.onsiteMinHours = minH;
         attendance.onsiteMaxHours = maxH;
       }
@@ -400,6 +425,8 @@ const checkIn = async (req, res) => {
           maxValidHours: maxH,
           onsiteDurationSeconds: 0,
           wfhDurationSeconds: 0,
+          onsiteAllocated: !isWfh,
+          wfhAllocated: isWfh,
           onsiteMinHours: !isWfh ? minH : 4,
           onsiteMaxHours: !isWfh ? maxH : 10,
           wfhMinHours: isWfh ? minH : 4,
@@ -619,7 +646,7 @@ const getAttendanceSummary = async (req, res) => {
     }
     
     const logs = await Attendance.find(query)
-      .select('studentId dateStr sessionDurationSeconds onsiteDurationSeconds wfhDurationSeconds onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours accessType isActive lastCheckInTime checkInTime checkOutTime isLeave leaveHours status')
+      .select('studentId dateStr sessionDurationSeconds onsiteDurationSeconds wfhDurationSeconds onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours onsiteAllocated wfhAllocated accessType isActive lastCheckInTime checkInTime checkOutTime isLeave leaveHours status')
       .populate('studentId', 'name email rollNumber')
       .sort({ dateStr: -1, createdAt: -1 })
       .lean();
@@ -659,6 +686,8 @@ const getAttendanceSummary = async (req, res) => {
         onsiteMaxHours: log.onsiteMaxHours || 10,
         wfhMinHours: log.wfhMinHours || 4,
         wfhMaxHours: log.wfhMaxHours || 10,
+        onsiteAllocated: Boolean(log.onsiteAllocated || (log.onsiteDurationSeconds > 0)),
+        wfhAllocated: Boolean(log.wfhAllocated || (log.wfhDurationSeconds > 0)),
         accessType: log.accessType || 'on-site',
         firstCheckIn: log.checkInTime,
         lastCheckOut: log.checkOutTime,
@@ -705,7 +734,7 @@ const getMyAttendanceSummary = async (req, res) => {
     }
 
     const logs = await Attendance.find(query)
-      .select('dateStr sessionDurationSeconds onsiteDurationSeconds wfhDurationSeconds onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours checkInTime lastCheckInTime checkOutTime isActive isLeave leaveHours status accessType workHours minRequiredHours maxValidHours')
+      .select('dateStr sessionDurationSeconds onsiteDurationSeconds wfhDurationSeconds onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours onsiteAllocated wfhAllocated checkInTime lastCheckInTime checkOutTime isActive isLeave leaveHours status accessType workHours minRequiredHours maxValidHours')
       .sort({ dateStr: -1, createdAt: -1 })
       .lean();
     
@@ -742,7 +771,10 @@ const getMyAttendanceSummary = async (req, res) => {
         onsiteMaxHours: log.onsiteMaxHours || 10,
         wfhMinHours: log.wfhMinHours || 4,
         wfhMaxHours: log.wfhMaxHours || 10,
+        onsiteAllocated: Boolean(log.onsiteAllocated || (log.onsiteDurationSeconds > 0)),
+        wfhAllocated: Boolean(log.wfhAllocated || (log.wfhDurationSeconds > 0)),
         firstCheckIn: log.checkInTime,
+        lastCheckInTime: log.lastCheckInTime,
         lastCheckOut: log.checkOutTime,
         isActive: log.isActive,
         isLeave: log.isLeave,

@@ -91,6 +91,38 @@ const grantAccess = async (req, res) => {
 
     await Promise.all(promises);
 
+    // Keep today's attendance records synchronized with newly granted hours and accessType
+    try {
+      const Attendance = require('../models/Attendance');
+      const { evaluateAttendanceRecord } = require('./attendanceController');
+      const todayAttendances = await Attendance.find({
+        studentId: { $in: targetStudentIds },
+        dateStr
+      });
+
+      for (const att of todayAttendances) {
+        att.workHours = effWorkHours;
+        att.minRequiredHours = effMinHours;
+        att.maxValidHours = effMaxHours;
+        att.accessType = type;
+        if (type === 'wfh') {
+          att.wfhAllocated = true;
+          att.wfhMinHours = effMinHours;
+          att.wfhMaxHours = effMaxHours;
+        } else {
+          att.onsiteAllocated = true;
+          att.onsiteMinHours = effMinHours;
+          att.onsiteMaxHours = effMaxHours;
+        }
+        if (!att.isActive) {
+          evaluateAttendanceRecord(att, 0);
+        }
+        await att.save();
+      }
+    } catch (syncErr) {
+      console.warn('Syncing attendance records on grantAccess warning:', syncErr.message);
+    }
+
     const skippedCount = studentIds.length - targetStudentIds.length;
     let message = 'Access granted successfully.';
     if (skippedCount > 0) {

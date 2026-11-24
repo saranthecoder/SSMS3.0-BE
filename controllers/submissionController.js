@@ -40,7 +40,7 @@ const submitTask = async (req, res) => {
     }
 
     // Calculate 10x allocated marks for gamification coins
-    const taskMarks = Number(task.maxMarks) || 0;
+    const taskMarks = (task.maxMarks !== undefined && Number(task.maxMarks) > 0) ? Number(task.maxMarks) : 10;
     const coinsToAward = Math.round(taskMarks * 10);
 
     if (submissionExists) {

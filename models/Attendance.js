@@ -50,6 +50,14 @@ const attendanceSchema = new mongoose.Schema({
     type: Number,
     default: 10
   },
+  onsiteAllocated: {
+    type: Boolean,
+    default: false
+  },
+  wfhAllocated: {
+    type: Boolean,
+    default: false
+  },
   accessType: {
     type: String,
     enum: ['on-site', 'wfh'],
