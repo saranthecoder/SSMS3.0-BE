@@ -63,6 +63,22 @@ const batchSchema = new mongoose.Schema({
   maxValidHours: {
     type: Number,
     default: 10
+  },
+  onsiteMinHours: {
+    type: Number,
+    default: 8
+  },
+  onsiteMaxHours: {
+    type: Number,
+    default: 10
+  },
+  wfhMinHours: {
+    type: Number,
+    default: 8
+  },
+  wfhMaxHours: {
+    type: Number,
+    default: 10
   }
 }, {
   timestamps: true

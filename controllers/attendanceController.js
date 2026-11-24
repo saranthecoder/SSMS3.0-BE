@@ -9,27 +9,75 @@ const getISTDateStr = (date = new Date()) => {
   return `${year}-${month}-${day}`;
 };
 
-const getBatchHourLimits = async (studentId) => {
+const getBatchHourLimits = async (studentId, dateStr = null, forcedAccessType = null) => {
   try {
     const Enrollment = require('../models/Enrollment');
+    const CheckInAccess = require('../models/CheckInAccess');
     const enrollment = await Enrollment.findOne({ studentId, status: 'approved' }).populate('batchId').lean();
-    if (enrollment && enrollment.batchId) {
-      return {
-        requiredPresentHours: enrollment.batchId.requiredPresentHours !== undefined ? enrollment.batchId.requiredPresentHours : 8,
-        maxValidHours: enrollment.batchId.maxValidHours !== undefined ? enrollment.batchId.maxValidHours : 10
-      };
+    const batch = enrollment && enrollment.batchId ? enrollment.batchId : null;
+
+    const targetDate = dateStr || getISTDateStr();
+    let access = null;
+    if (studentId) {
+      access = await CheckInAccess.findOne({ studentId, dateStr: targetDate }).lean();
     }
+
+    const mode = forcedAccessType || (access && access.accessType) || 'on-site';
+
+    // Default admin limits based on work mode
+    let minRequired = 8;
+    let maxAllowed = 10;
+
+    if (batch) {
+      if (mode === 'wfh') {
+        minRequired = batch.wfhMinHours !== undefined ? Number(batch.wfhMinHours) : (batch.requiredPresentHours !== undefined ? Number(batch.requiredPresentHours) : 8);
+        maxAllowed = batch.wfhMaxHours !== undefined ? Number(batch.wfhMaxHours) : (batch.maxValidHours !== undefined ? Number(batch.maxValidHours) : 10);
+      } else {
+        minRequired = batch.onsiteMinHours !== undefined ? Number(batch.onsiteMinHours) : (batch.requiredPresentHours !== undefined ? Number(batch.requiredPresentHours) : 8);
+        maxAllowed = batch.onsiteMaxHours !== undefined ? Number(batch.onsiteMaxHours) : (batch.maxValidHours !== undefined ? Number(batch.maxValidHours) : 10);
+      }
+    }
+
+    // Mentor day-wise fixed work time overrides default minRequired
+    if (access && access.workHours !== undefined && access.workHours !== null) {
+      minRequired = Number(access.workHours);
+    } else if (access && access.minHours !== undefined && access.minHours !== null) {
+      minRequired = Number(access.minHours);
+    }
+
+    if (access && access.maxHours !== undefined && access.maxHours !== null) {
+      maxAllowed = Number(access.maxHours);
+    }
+
+    return {
+      requiredPresentHours: minRequired,
+      maxValidHours: maxAllowed,
+      onsiteMinHours: batch?.onsiteMinHours || 8,
+      onsiteMaxHours: batch?.onsiteMaxHours || 10,
+      wfhMinHours: batch?.wfhMinHours || 8,
+      wfhMaxHours: batch?.wfhMaxHours || 10,
+      accessType: mode,
+      workHours: access?.workHours || minRequired
+    };
   } catch (err) {
     console.error('Error fetching batch hour limits:', err);
   }
-  return { requiredPresentHours: 8, maxValidHours: 10 };
+  return { 
+    requiredPresentHours: 8, 
+    maxValidHours: 10,
+    onsiteMinHours: 8,
+    onsiteMaxHours: 10,
+    wfhMinHours: 8,
+    wfhMaxHours: 10,
+    accessType: 'on-site', 
+    workHours: 8 
+  };
 };
 
 // Helper: Auto-close any open sessions from previous days for a student
 const autoCloseOldSessions = async (studentId) => {
   try {
     const todayStr = getISTDateStr();
-    const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(studentId);
 
     // Find all active records from before today for this student
     const activeRecords = await Attendance.find({
@@ -37,6 +85,12 @@ const autoCloseOldSessions = async (studentId) => {
       isActive: true,
       dateStr: { $lt: todayStr }
     });
+
+    if (!activeRecords || activeRecords.length === 0) {
+      return;
+    }
+
+    const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(studentId, todayStr);
 
     for (const record of activeRecords) {
       const recordDate = new Date(record.dateStr);
@@ -96,7 +150,7 @@ const autoCloseAllOldSessions = async () => {
       if (record.isLeave && (record.leaveHours || 0) === 0) {
         record.status = 'Leave';
       } else {
-        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(record.studentId);
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(record.studentId, record.dateStr, record.accessType);
         const hours = (record.sessionDurationSeconds || 0) / 3600;
         const minRequired = requiredPresentHours - (record.leaveHours || 0);
         if (hours >= minRequired && hours <= maxValidHours) {
@@ -264,42 +318,76 @@ const checkIn = async (req, res) => {
       attendance.lastCheckInTime = Date.now();
       attendance.isActive = true;
       attendance.status = 'In Progress';
+      attendance.accessType = access.accessType || 'on-site';
+      if (access.workHours || access.minHours) {
+        attendance.workHours = access.workHours || access.minHours;
+      }
       await attendance.save();
     } else {
-      attendance = await Attendance.create({
-        studentId: req.user._id,
-        dateStr: dateStr,
-        checkInTime: Date.now(),
-        lastCheckInTime: Date.now(),
-        isActive: true
-      });
+      try {
+        attendance = await Attendance.create({
+          studentId: req.user._id,
+          dateStr: dateStr,
+          checkInTime: Date.now(),
+          lastCheckInTime: Date.now(),
+          accessType: access.accessType || 'on-site',
+          workHours: access.workHours || access.minHours || null,
+          isActive: true
+        });
+      } catch (createErr) {
+        // Handle race condition where concurrent request already created today's record
+        if (createErr.code === 11000) {
+          attendance = await Attendance.findOne({
+            studentId: req.user._id,
+            dateStr: dateStr
+          });
+          if (attendance && attendance.isActive) {
+            return res.status(200).json(attendance);
+          }
+        } else {
+          throw createErr;
+        }
+      }
     }
 
-    // ─── Attendance Streak Tracking ───
+    // ─── Attendance Streak Tracking (Concurrency-Safe) ───
     try {
       const User = require('../models/User');
       const { isSameDay, isYesterday, awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges, checkAndAwardStreakMilestones } = require('../utils/gamification');
-      const studentUser = await User.findById(req.user._id);
-      if (studentUser && !isSameDay(studentUser.lastAttendanceDate, now)) {
-        // New day check-in
-        if (isYesterday(studentUser.lastAttendanceDate)) {
-          studentUser.attendanceStreak = (studentUser.attendanceStreak || 0) + 1;
-        } else if (!studentUser.lastAttendanceDate) {
-          studentUser.attendanceStreak = 1;
-        } else {
-          studentUser.attendanceStreak = 1; // streak broken
+      
+      const startOfToday = new Date(istTime.getFullYear(), istTime.getMonth(), istTime.getDate());
+      // Atomically claim today's attendance streak to prevent duplicate rewards under concurrent requests
+      const priorUserDoc = await User.findOneAndUpdate(
+        {
+          _id: req.user._id,
+          $or: [
+            { lastAttendanceDate: { $exists: false } },
+            { lastAttendanceDate: null },
+            { lastAttendanceDate: { $lt: startOfToday } }
+          ]
+        },
+        { $set: { lastAttendanceDate: now } },
+        { returnDocument: 'before' }
+      );
+
+      if (priorUserDoc) {
+        const studentUser = await User.findById(req.user._id);
+        if (studentUser) {
+          if (isYesterday(priorUserDoc.lastAttendanceDate)) {
+            studentUser.attendanceStreak = (priorUserDoc.attendanceStreak || 0) + 1;
+          } else {
+            studentUser.attendanceStreak = 1;
+          }
+
+          // Award base attendance XP
+          awardCoinsWithCap(studentUser, 10, 'Daily attendance check-in');
+          awardXPWithCap(studentUser, 20, 'Daily attendance check-in');
+
+          // Check milestones & badges
+          checkAndAwardStreakMilestones(studentUser);
+          checkAndAwardBadges(studentUser);
+          await studentUser.save();
         }
-        studentUser.lastAttendanceDate = now;
-
-        // Award base attendance XP
-        awardCoinsWithCap(studentUser, 10, 'Daily attendance check-in');
-        awardXPWithCap(studentUser, 20, 'Daily attendance check-in');
-
-        // Check milestones
-        checkAndAwardStreakMilestones(studentUser);
-
-        checkAndAwardBadges(studentUser);
-        await studentUser.save();
       }
     } catch (streakErr) {
       console.error('Attendance streak tracking error:', streakErr);
@@ -338,7 +426,7 @@ const checkOut = async (req, res) => {
       if (attendance.isLeave && (attendance.leaveHours || 0) === 0) {
         attendance.status = 'Leave';
       } else {
-        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(req.user._id);
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(req.user._id, attendance.dateStr, attendance.accessType);
         const hours = (attendance.sessionDurationSeconds || 0) / 3600;
         const minRequired = requiredPresentHours - (attendance.leaveHours || 0);
         if (hours >= minRequired && hours <= maxValidHours) {
@@ -364,10 +452,7 @@ const checkOut = async (req, res) => {
 // @access  Private/Admin
 const getAllAttendance = async (req, res) => {
   try {
-    // Auto-close stale active sessions globally to ensure admin sees accurate dashboard states
-    await autoCloseAllOldSessions();
-
-    const { batchId } = req.query;
+    const { batchId, page: pageQuery, limit: limitQuery, paginated } = req.query;
     let query = {};
     const Enrollment = require('../models/Enrollment');
     const Batch = require('../models/Batch');
@@ -381,19 +466,42 @@ const getAllAttendance = async (req, res) => {
         targetBatchIds = [batchId];
       }
       
-      const enrollments = await Enrollment.find({ batchId: { $in: targetBatchIds }, status: 'approved' });
+      const enrollments = await Enrollment.find({ batchId: { $in: targetBatchIds }, status: 'approved' }).select('studentId').lean();
       const studentIds = enrollments.map(e => e.studentId);
       query = { studentId: { $in: studentIds } };
     } else if (batchId) {
-      const enrollments = await Enrollment.find({ batchId, status: 'approved' });
+      const enrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
       const studentIds = enrollments.map(e => e.studentId);
       query = { studentId: { $in: studentIds } };
     }
     
-    const logs = await Attendance.find(query)
-      .populate('studentId', 'name email')
-      .sort({ createdAt: -1 });
+    const page = parseInt(pageQuery, 10);
+    const limit = parseInt(limitQuery, 10);
+
+    if (page > 0 && limit > 0) {
+      const skip = (page - 1) * limit;
+      const [logs, total] = await Promise.all([
+        Attendance.find(query)
+          .populate('studentId', 'name email rollNumber')
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .lean(),
+        Attendance.countDocuments(query)
+      ]);
+      res.setHeader('X-Total-Count', total);
+      if (paginated === 'true') {
+        return res.json({ logs, total, page, totalPages: Math.ceil(total / limit) });
+      }
+      return res.json(logs);
+    }
     
+    const logs = await Attendance.find(query)
+      .populate('studentId', 'name email rollNumber')
+      .sort({ createdAt: -1 })
+      .lean();
+    
+    res.setHeader('X-Total-Count', logs.length);
     res.json(logs);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -406,7 +514,8 @@ const getAllAttendance = async (req, res) => {
 const getMyAttendance = async (req, res) => {
   try {
     const logs = await Attendance.find({ studentId: req.user._id })
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
     res.json(logs);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -418,8 +527,6 @@ const getMyAttendance = async (req, res) => {
 // @access  Private/Admin
 const getAttendanceSummary = async (req, res) => {
   try {
-    // Auto-close stale active sessions globally to ensure admin sees accurate dashboard states
-    await autoCloseAllOldSessions();
 
     const { batchId } = req.query;
     const Enrollment = require('../models/Enrollment');
@@ -518,7 +625,7 @@ const getMyAttendanceSummary = async (req, res) => {
     }
 
     const logs = await Attendance.find(query)
-      .select('dateStr sessionDurationSeconds checkInTime lastCheckInTime checkOutTime isActive isLeave leaveHours status')
+      .select('dateStr sessionDurationSeconds checkInTime lastCheckInTime checkOutTime isActive isLeave leaveHours status accessType workHours minRequiredHours maxValidHours')
       .sort({ dateStr: -1, createdAt: -1 })
       .lean();
     
@@ -528,6 +635,9 @@ const getMyAttendanceSummary = async (req, res) => {
         currentDuration += Math.floor((Date.now() - new Date(log.lastCheckInTime).getTime()) / 1000);
       }
       
+      const dayReqHours = log.minRequiredHours !== undefined ? log.minRequiredHours : (log.workHours || reqHours);
+      const dayMaxHours = log.maxValidHours !== undefined ? log.maxValidHours : maxHours;
+
       return {
         _id: log._id,
         date: log.dateStr,
@@ -538,8 +648,10 @@ const getMyAttendanceSummary = async (req, res) => {
         isLeave: log.isLeave,
         leaveHours: log.leaveHours,
         status: log.status,
-        requiredPresentHours: reqHours,
-        maxValidHours: maxHours
+        accessType: log.accessType || 'on-site',
+        workHours: log.workHours || dayReqHours,
+        requiredPresentHours: dayReqHours,
+        maxValidHours: dayMaxHours
       };
     });
     
@@ -572,7 +684,7 @@ const adminCheckOutStudent = async (req, res) => {
       if (attendance.isLeave && (attendance.leaveHours || 0) === 0) {
         attendance.status = 'Leave';
       } else {
-        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(attendance.studentId);
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(attendance.studentId, attendance.dateStr, attendance.accessType);
         const hours = (attendance.sessionDurationSeconds || 0) / 3600;
         const minRequired = requiredPresentHours - (attendance.leaveHours || 0);
         if (hours >= minRequired && hours <= maxValidHours) {
@@ -598,6 +710,57 @@ const adminCheckOutStudent = async (req, res) => {
     res.json(attendance);
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Auto check-out student (e.g. on disciplinary suspension or block)
+const autoCheckOutStudent = async (studentId, reason = 'Administrative action') => {
+  try {
+    const activeAttendance = await Attendance.findOne({ studentId, isActive: true });
+    if (!activeAttendance) return null;
+
+    const now = Date.now();
+    const durationMs = activeAttendance.lastCheckInTime ? (now - new Date(activeAttendance.lastCheckInTime).getTime()) : 0;
+    activeAttendance.sessionDurationSeconds = (activeAttendance.sessionDurationSeconds || 0) + Math.max(0, Math.floor(durationMs / 1000));
+    activeAttendance.checkOutTime = now;
+    activeAttendance.isActive = false;
+
+    if (activeAttendance.isLeave && (activeAttendance.leaveHours || 0) === 0) {
+      activeAttendance.status = 'Leave';
+    } else {
+      const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(studentId, activeAttendance.dateStr, activeAttendance.accessType);
+      const hours = (activeAttendance.sessionDurationSeconds || 0) / 3600;
+      const minRequired = requiredPresentHours - (activeAttendance.leaveHours || 0);
+      if (hours >= minRequired && hours <= maxValidHours) {
+        activeAttendance.status = 'Present';
+      } else if (hours > maxValidHours) {
+        activeAttendance.status = 'Invalid';
+      } else {
+        activeAttendance.status = 'Absent';
+      }
+    }
+
+    await activeAttendance.save();
+
+    // Emit real-time socket events
+    try {
+      const { emitToUser, getIO } = require('../sockets/socketHandlers');
+      emitToUser(studentId.toString(), 'force-checkout', { 
+        attendanceId: activeAttendance._id, 
+        reason: reason || 'Access suspended or blocked' 
+      });
+      const io = getIO();
+      if (io) {
+        io.emit('attendanceUpdate', { studentId: studentId.toString(), status: 'checked-out', reason });
+      }
+    } catch (socketErr) {
+      console.warn('Socket emit warning on auto-checkout:', socketErr.message);
+    }
+
+    return activeAttendance;
+  } catch (err) {
+    console.error('Error in autoCheckOutStudent:', err);
+    return null;
   }
 };
 
@@ -627,7 +790,7 @@ const adminCheckOutAll = async (req, res) => {
       if (attendance.isLeave && (attendance.leaveHours || 0) === 0) {
         attendance.status = 'Leave';
       } else {
-        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(attendance.studentId);
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(attendance.studentId, attendance.dateStr, attendance.accessType);
         const hours = (attendance.sessionDurationSeconds || 0) / 3600;
         const minRequired = requiredPresentHours - (attendance.leaveHours || 0);
         if (hours >= minRequired && hours <= maxValidHours) {
@@ -656,12 +819,25 @@ const adminCheckOutAll = async (req, res) => {
   }
 };
 
+// In-memory bounded cache for active student count
+const activeCountCache = new Map();
+const ACTIVE_COUNT_CACHE_TTL_MS = 5000; // 5 seconds
+
 // @desc    Get count of active students
 // @route   GET /api/attendance/active-count
 // @access  Private (Student/Admin/Mentor)
 const getActiveCount = async (req, res) => {
   try {
     const { batchId } = req.query;
+    const cacheKey = `${req.user._id}_${req.user.role}_${batchId || 'default'}`;
+    const now = Date.now();
+    if (activeCountCache.has(cacheKey)) {
+      const cached = activeCountCache.get(cacheKey);
+      if (now - cached.timestamp < ACTIVE_COUNT_CACHE_TTL_MS) {
+        return res.json({ activeCount: cached.count });
+      }
+    }
+
     const Enrollment = require('../models/Enrollment');
     const Batch = require('../models/Batch');
 
@@ -722,6 +898,7 @@ const getActiveCount = async (req, res) => {
     }
 
     const activeCount = await Attendance.countDocuments(query);
+    activeCountCache.set(cacheKey, { count: activeCount, timestamp: Date.now() });
     res.json({ activeCount });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -767,7 +944,7 @@ const getPublicAttendanceSummary = async (req, res) => {
         .select('studentId dateStr sessionDurationSeconds isActive lastCheckInTime checkInTime checkOutTime isLeave leaveHours status')
         .lean(),
       CheckInAccess.find(batchId ? { batchId, dateStr: targetDateStr } : { dateStr: targetDateStr })
-        .select('studentId dateStr accessType')
+        .select('studentId dateStr accessType workHours minHours maxHours')
         .lean(),
       Leave.find({
         status: 'approved',
@@ -789,7 +966,7 @@ const getPublicAttendanceSummary = async (req, res) => {
     
     const accessMap = {};
     accessGrants.forEach(grant => {
-      accessMap[String(grant.studentId)] = grant.accessType;
+      accessMap[String(grant.studentId)] = grant;
     });
 
     const leavesMap = {};
@@ -800,7 +977,9 @@ const getPublicAttendanceSummary = async (req, res) => {
     const summaryList = students.map(student => {
       const sId = String(student._id);
       const log = logsMap[sId];
-      const accessType = accessMap[sId] || 'on-site';
+      const grant = accessMap[sId];
+      const accessType = grant?.accessType || log?.accessType || 'on-site';
+      const workHours = grant?.workHours || grant?.minHours || log?.workHours || null;
       const studentLeave = leavesMap[sId];
       
       let currentDuration = log ? log.sessionDurationSeconds : 0;
@@ -831,6 +1010,7 @@ const getPublicAttendanceSummary = async (req, res) => {
         leaveType: studentLeave ? studentLeave.leaveType : null,
         status: log ? log.status : 'Absent',
         accessType,
+        workHours,
         isCheckedIn: !!log
       };
     });
@@ -885,8 +1065,10 @@ module.exports = {
   getMyAttendanceSummary,
   adminCheckOutStudent,
   adminCheckOutAll,
+  autoCheckOutStudent,
   getActiveCount,
   getPublicAttendanceSummary,
   updateAttendanceRecord,
-  processBatchAutoCheckouts
+  processBatchAutoCheckouts,
+  autoCloseAllOldSessions
 };

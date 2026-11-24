@@ -6,14 +6,40 @@ const Grade = require('../models/Grade');
 const Attendance = require('../models/Attendance');
 const User = require('../models/User');
 
+// Auto-close expired batches by deadline
+const autoCloseExpiredBatches = async () => {
+  try {
+    const now = new Date();
+    await Batch.updateMany(
+      {
+        status: { $ne: 'Completed' },
+        endDate: { $lte: now }
+      },
+      {
+        $set: { status: 'Completed' }
+      }
+    );
+  } catch (err) {
+    console.error('Error auto-closing expired batches:', err.message);
+  }
+};
+
 // @desc    Create a batch
 // @route   POST /api/batches
 // @access  Private/Admin
 const createBatch = async (req, res) => {
   try {
-    const { batchName, panelName, panelSubheading, description, startDate, endDate, status, mentorId, requiredPresentHours, maxValidHours, checkInTime, checkOutTime, autoCheckOutTime, autoCheckOutEnabled } = req.body;
+    const { 
+      batchName, panelName, panelSubheading, description, startDate, endDate, status, mentorId, 
+      requiredPresentHours, maxValidHours, onsiteMinHours, onsiteMaxHours, wfhMinHours, wfhMaxHours,
+      checkInTime, checkOutTime, autoCheckOutTime, autoCheckOutEnabled 
+    } = req.body;
 
     const assignedMentorId = mentorId || (req.user && req.user.role === 'mentor' ? req.user._id : null);
+    const effOnsiteMin = onsiteMinHours !== undefined ? Number(onsiteMinHours) : (requiredPresentHours !== undefined ? Number(requiredPresentHours) : 8);
+    const effOnsiteMax = onsiteMaxHours !== undefined ? Number(onsiteMaxHours) : (maxValidHours !== undefined ? Number(maxValidHours) : 10);
+    const effWfhMin = wfhMinHours !== undefined ? Number(wfhMinHours) : effOnsiteMin;
+    const effWfhMax = wfhMaxHours !== undefined ? Number(wfhMaxHours) : effOnsiteMax;
 
     const batch = await Batch.create({
       batchName,
@@ -24,8 +50,12 @@ const createBatch = async (req, res) => {
       endDate: endDate || new Date(Date.now() + 90 * 24 * 60 * 60 * 1000),
       status: status || 'Active',
       mentorId: assignedMentorId,
-      requiredPresentHours: requiredPresentHours !== undefined ? Number(requiredPresentHours) : 8,
-      maxValidHours: maxValidHours !== undefined ? Number(maxValidHours) : 10,
+      requiredPresentHours: effOnsiteMin,
+      maxValidHours: effOnsiteMax,
+      onsiteMinHours: effOnsiteMin,
+      onsiteMaxHours: effOnsiteMax,
+      wfhMinHours: effWfhMin,
+      wfhMaxHours: effWfhMax,
       checkInTime: checkInTime || '09:00',
       checkOutTime: checkOutTime || '17:00',
       autoCheckOutTime: autoCheckOutTime || '21:00',
@@ -44,9 +74,22 @@ const createBatch = async (req, res) => {
 // @access  Private
 const getBatches = async (req, res) => {
   try {
+    await autoCloseExpiredBatches();
+
     let query = {};
     if (req.user && req.user.role === 'mentor') {
-      query.mentorId = req.user._id;
+      const uId = req.user._id;
+      const uIdStr = uId ? uId.toString() : '';
+      const uObjId = mongoose.Types.ObjectId.isValid(uId) ? new mongoose.Types.ObjectId(uId) : null;
+      
+      const orConditions = [];
+      if (uObjId) {
+        orConditions.push({ mentorId: uObjId }, { mentors: uObjId });
+      }
+      if (uIdStr) {
+        orConditions.push({ mentorId: uIdStr }, { mentors: uIdStr });
+      }
+      query.$or = orConditions.length > 0 ? orConditions : [{ mentorId: uId }];
     }
 
     const batches = await Batch.find(query).populate('mentorId', 'name email phone profileImage equippedAvatar').lean();
@@ -61,6 +104,8 @@ const getBatches = async (req, res) => {
 // @access  Private
 const getBatchById = async (req, res) => {
   try {
+    await autoCloseExpiredBatches();
+
     const batch = await Batch.findById(req.params.id).populate('mentorId', 'name email phone profileImage equippedAvatar').lean();
 
     if (batch) {
@@ -78,7 +123,26 @@ const getBatchById = async (req, res) => {
 // @access  Private/Admin
 const updateBatch = async (req, res) => {
   try {
-    const batch = await Batch.findByIdAndUpdate(req.params.id, req.body, {
+    const updateData = { ...req.body };
+    
+    // If updating endDate to the past, auto-mark completed; if explicitly active with future date, update
+    if (updateData.endDate && new Date(updateData.endDate) <= new Date() && updateData.status !== 'Upcoming') {
+      updateData.status = 'Completed';
+    }
+
+    // Sync attendance hour limits
+    if (updateData.onsiteMinHours !== undefined) {
+      updateData.requiredPresentHours = Number(updateData.onsiteMinHours);
+    } else if (updateData.requiredPresentHours !== undefined) {
+      updateData.onsiteMinHours = Number(updateData.requiredPresentHours);
+    }
+    if (updateData.onsiteMaxHours !== undefined) {
+      updateData.maxValidHours = Number(updateData.onsiteMaxHours);
+    } else if (updateData.maxValidHours !== undefined) {
+      updateData.onsiteMaxHours = Number(updateData.maxValidHours);
+    }
+
+    const batch = await Batch.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
       runValidators: true
     }).populate('mentorId', 'name email phone');
@@ -88,6 +152,35 @@ const updateBatch = async (req, res) => {
     } else {
       res.status(404).json({ message: 'Batch not found' });
     }
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// @desc    Close a batch or update close batch date
+// @route   PUT /api/batches/:id/close
+// @access  Private/Admin
+const closeBatch = async (req, res) => {
+  try {
+    const { closeDate, status = 'Completed' } = req.body;
+    const updateData = { status };
+    if (closeDate) {
+      updateData.endDate = new Date(closeDate);
+    } else if (status === 'Completed') {
+      updateData.endDate = new Date();
+    }
+
+    const batch = await Batch.findByIdAndUpdate(
+      req.params.id,
+      { $set: updateData },
+      { new: true, runValidators: true }
+    ).populate('mentorId', 'name email phone profileImage equippedAvatar');
+
+    if (!batch) {
+      return res.status(404).json({ message: 'Batch not found' });
+    }
+
+    res.json(batch);
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -209,7 +302,52 @@ const getBatchReport = async (req, res) => {
     const uniqueDates = Array.from(new Set(attendanceRecords.map(r => r.dateStr))).sort();
     const totalSessions = uniqueDates.length;
 
-    // 8. Aggregate data per student
+    // ─── Build O(1) Fast Lookup Maps to eliminate quadratic nested iterations ───
+    const studentSubmissionsMap = new Map();
+    const submissionByStudentTaskMap = new Map();
+    for (let i = 0; i < submissions.length; i++) {
+      const s = submissions[i];
+      if (!s.studentId) continue;
+      const sId = s.studentId.toString();
+      let list = studentSubmissionsMap.get(sId);
+      if (!list) {
+        list = [];
+        studentSubmissionsMap.set(sId, list);
+      }
+      list.push(s);
+      if (s.taskId) {
+        submissionByStudentTaskMap.set(`${sId}_${s.taskId.toString()}`, s);
+      }
+    }
+
+    const attendanceByStudentDateMap = new Map();
+    for (let i = 0; i < attendanceRecords.length; i++) {
+      const r = attendanceRecords[i];
+      if (!r.studentId || !r.dateStr) continue;
+      attendanceByStudentDateMap.set(`${r.studentId.toString()}_${r.dateStr}`, r);
+    }
+
+    const studentMockScoresMapById = new Map();
+    const mockScoreByStudentDriveMap = new Map();
+    for (let i = 0; i < mockDriveScores.length; i++) {
+      const mds = mockDriveScores[i];
+      if (!mds.studentId) continue;
+      const sId = mds.studentId.toString();
+      let list = studentMockScoresMapById.get(sId);
+      if (!list) {
+        list = [];
+        studentMockScoresMapById.set(sId, list);
+      }
+      list.push(mds);
+      if (mds.mockDriveId) {
+        mockScoreByStudentDriveMap.set(`${sId}_${mds.mockDriveId.toString()}`, mds);
+      }
+    }
+
+    const reqHours = batch && batch.requiredPresentHours !== undefined ? batch.requiredPresentHours : 8;
+    const maxHours = batch && batch.maxValidHours !== undefined ? batch.maxValidHours : 10;
+
+    // 8. Aggregate data per student using O(1) lookups
     const reportData = students.map(student => {
       const sId = student._id.toString();
       const totalTaskScore = roundToTwo(studentTaskScores[sId] || 0);
@@ -217,24 +355,23 @@ const getBatchReport = async (req, res) => {
       const streakScore = (student.leetcodeStreak || 0) * 10;
       const overallScore = roundToTwo(totalTaskScore + totalMockDriveScore + streakScore);
 
-      const studentSubmissions = submissions.filter(s => s.studentId && s.studentId.toString() === sId);
+      const studentSubmissions = studentSubmissionsMap.get(sId) || [];
+      const studentMockScores = studentMockScoresMapById.get(sId) || [];
 
-      // Calculate attendance statistics
-      const studentAttendance = attendanceRecords.filter(r => r.studentId && r.studentId.toString() === sId);
+      // Calculate attendance statistics with O(1) Map lookups
       let presentCount = 0;
       let absentCount = 0;
       let leaveCount = 0;
       let invalidCount = 0;
       let inProgressCount = 0;
 
-      uniqueDates.forEach(date => {
-        const record = studentAttendance.find(r => r.dateStr === date);
+      for (let i = 0; i < uniqueDates.length; i++) {
+        const date = uniqueDates[i];
+        const record = attendanceByStudentDateMap.get(`${sId}_${date}`);
         if (record) {
           if ((record.isLeave || record.status === 'Leave') && (record.leaveHours || 0) === 0) {
             leaveCount++;
           } else {
-            const reqHours = batch.requiredPresentHours !== undefined ? batch.requiredPresentHours : 8;
-            const maxHours = batch.maxValidHours !== undefined ? batch.maxValidHours : 10;
             const hours = (record.sessionDurationSeconds || 0) / 3600;
             const minRequired = reqHours - (record.leaveHours || 0);
             if (hours >= minRequired && hours <= maxHours) {
@@ -250,13 +387,10 @@ const getBatchReport = async (req, res) => {
         } else {
           absentCount++;
         }
-      });
+      }
 
       const denominator = totalSessions - leaveCount;
       const attendancePercentage = denominator > 0 ? Math.round((presentCount / denominator) * 100) : (totalSessions > 0 ? Math.round((presentCount / totalSessions) * 100) : 0);
-
-      // Get mock drive scores array for count and individual values
-      const studentMockScores = mockDriveScores.filter(mds => mds.studentId && mds.studentId.toString() === sId);
 
       // Build basic flat report row
       const row = {
@@ -287,9 +421,9 @@ const getBatchReport = async (req, res) => {
         'Batch Rank': studentRanks[student._id.toString()] || 'N/A'
       };
 
-      // Add individual Task Scores
+      // Add individual Task Scores with O(1) lookup
       tasks.forEach(t => {
-        const sub = studentSubmissions.find(s => s.taskId && s.taskId.toString() === t._id.toString());
+        const sub = submissionByStudentTaskMap.get(`${sId}_${t._id.toString()}`);
         if (sub) {
           const marks = gradeMap[sub._id.toString()];
           row[`Task: ${t.title} (Score)`] = (marks !== undefined) ? roundToTwo(marks) : 'Submitted (Not Graded)';
@@ -298,9 +432,9 @@ const getBatchReport = async (req, res) => {
         }
       });
 
-      // Add individual Mock Drive details
+      // Add individual Mock Drive details with O(1) lookup
       mockDrives.forEach(md => {
-        const score = studentMockScores.find(mds => mds.mockDriveId && mds.mockDriveId.toString() === md._id.toString());
+        const score = mockScoreByStudentDriveMap.get(`${sId}_${md._id.toString()}`);
         if (score) {
           row[`Mock Drive: ${md.title} (MCQ)`] = roundToTwo(score.mcq || 0);
           row[`Mock Drive: ${md.title} (Coding)`] = roundToTwo(score.coding || 0);
@@ -314,16 +448,14 @@ const getBatchReport = async (req, res) => {
         }
       });
 
-      // Add individual Attendance Sessions
+      // Add individual Attendance Sessions with O(1) lookup
       uniqueDates.forEach((dateStr, index) => {
-        const record = studentAttendance.find(r => r.dateStr === dateStr);
+        const record = attendanceByStudentDateMap.get(`${sId}_${dateStr}`);
         let status = 'Absent';
         if (record) {
           if ((record.isLeave || record.status === 'Leave') && (record.leaveHours || 0) === 0) {
             status = 'Leave';
           } else {
-            const reqHours = batch.requiredPresentHours !== undefined ? batch.requiredPresentHours : 8;
-            const maxHours = batch.maxValidHours !== undefined ? batch.maxValidHours : 10;
             const hours = (record.sessionDurationSeconds || 0) / 3600;
             const minRequired = reqHours - (record.leaveHours || 0);
             if (hours >= minRequired && hours <= maxHours) {
@@ -496,6 +628,11 @@ const bulkUploadStudents = async (req, res) => {
     let enrolledCount = 0;
     const errors = [];
 
+    // Pre-validate and gather search keys for batch querying
+    const parsedRows = [];
+    const rollNumbers = [];
+    const emails = [];
+
     for (let i = 0; i < students.length; i++) {
       const s = students[i];
       const name = (s.name || s.Name || '').trim();
@@ -516,45 +653,83 @@ const bulkUploadStudents = async (req, res) => {
         email = `${rollNumber.toLowerCase().replace(/[^a-z0-9]/g, '')}@student.ssms.edu`;
       }
 
+      parsedRows.push({ rowIndex: i + 1, name, rollNumber, email, password });
+      rollNumbers.push(rollNumber);
+      emails.push(email);
+    }
+
+    // 1 single batch query to find all matching users across rollNumbers and emails
+    const existingUsers = await User.find({
+      $or: [
+        { rollNumber: { $in: rollNumbers } },
+        { email: { $in: emails } }
+      ]
+    });
+
+    const userByRoll = new Map();
+    const userByEmail = new Map();
+    existingUsers.forEach(u => {
+      if (u.rollNumber) userByRoll.set(u.rollNumber.trim().toLowerCase(), u);
+      if (u.email) userByEmail.set(u.email.trim().toLowerCase(), u);
+    });
+
+    // 1 single batch query to find all existing enrollments in this batch for the existing users
+    const existingUserIds = existingUsers.map(u => u._id);
+    const existingEnrollments = await Enrollment.find({
+      batchId,
+      studentId: { $in: existingUserIds }
+    }).select('studentId').lean();
+    const enrolledUserIds = new Set(existingEnrollments.map(e => e.studentId.toString()));
+
+    // Process each student record
+    for (const row of parsedRows) {
       try {
-        let user = await User.findOne({
-          $or: [
-            { rollNumber: { $regex: new RegExp(`^${rollNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
-            { email: email }
-          ]
-        });
+        let user = userByRoll.get(row.rollNumber.toLowerCase()) || userByEmail.get(row.email.toLowerCase());
 
         if (!user) {
           user = await User.create({
-            name,
-            rollNumber,
-            email,
-            password,
+            name: row.name,
+            rollNumber: row.rollNumber,
+            email: row.email,
+            password: row.password,
             role: 'student',
             isProfileComplete: false
           });
+          userByRoll.set(row.rollNumber.toLowerCase(), user);
+          userByEmail.set(row.email.toLowerCase(), user);
           createdCount++;
         } else {
+          let updated = false;
           if (user.role !== 'student') {
             user.role = 'student';
+            updated = true;
           }
-          if (name) user.name = name;
-          if (rollNumber) user.rollNumber = rollNumber;
-          await user.save();
+          if (row.name && user.name !== row.name) {
+            user.name = row.name;
+            updated = true;
+          }
+          if (row.rollNumber && user.rollNumber !== row.rollNumber) {
+            user.rollNumber = row.rollNumber;
+            updated = true;
+          }
+          if (updated) {
+            await user.save();
+          }
         }
 
         // Enroll student if not already enrolled
-        const existingEnrollment = await Enrollment.findOne({ studentId: user._id, batchId });
-        if (!existingEnrollment) {
+        const sIdStr = user._id.toString();
+        if (!enrolledUserIds.has(sIdStr)) {
           await Enrollment.create({
             studentId: user._id,
             batchId,
             status: 'approved'
           });
+          enrolledUserIds.add(sIdStr);
           enrolledCount++;
         }
       } catch (err) {
-        errors.push(`Row ${i + 1} (${rollNumber}): ${err.message}`);
+        errors.push(`Row ${row.rowIndex} (${row.rollNumber}): ${err.message}`);
       }
     }
 
@@ -575,6 +750,8 @@ module.exports = {
   getBatches,
   getBatchById,
   updateBatch,
+  closeBatch,
+  autoCloseExpiredBatches,
   deleteBatch,
   getBatchReport,
   downloadStudentTemplate,

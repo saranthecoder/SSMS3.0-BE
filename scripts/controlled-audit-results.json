@@ -1,0 +1,101 @@
+{
+  "stage0_auth": {
+    "authenticated": 150,
+    "wallTime": 23495
+  },
+  "stage1_25vu": {
+    "vuCount": 25,
+    "totalRequests": 125,
+    "wallTimeMs": 6898,
+    "successful": 125,
+    "failed": 0,
+    "timeouts": 0,
+    "errorRate": 0,
+    "rps": 18.1,
+    "p50": 5121.3,
+    "p90": 6389.9,
+    "p95": 6398.3,
+    "p99": 6817.1,
+    "max": 6897.2,
+    "cpuPercent": 1,
+    "memoryPercent": 99
+  },
+  "stage2_50vu": {
+    "vuCount": 50,
+    "totalRequests": 250,
+    "wallTimeMs": 7414,
+    "successful": 248,
+    "failed": 2,
+    "timeouts": 0,
+    "errorRate": 0.8,
+    "rps": 33.7,
+    "p50": 3328,
+    "p90": 6609.4,
+    "p95": 6758.7,
+    "p99": 7403.4,
+    "max": 7408.8,
+    "cpuPercent": 1,
+    "memoryPercent": 99
+  },
+  "stage3_100vu": {
+    "vuCount": 100,
+    "totalRequests": 500,
+    "wallTimeMs": 12357,
+    "successful": 500,
+    "failed": 0,
+    "timeouts": 0,
+    "errorRate": 0,
+    "rps": 40.5,
+    "p50": 4662,
+    "p90": 11981.6,
+    "p95": 12160,
+    "p99": 12337.7,
+    "max": 12338.8,
+    "cpuPercent": 1,
+    "memoryPercent": 99
+  },
+  "stage4_150vu": {
+    "vuCount": 150,
+    "totalRequests": 750,
+    "wallTimeMs": 14161,
+    "successful": 750,
+    "failed": 0,
+    "timeouts": 0,
+    "errorRate": 0,
+    "rps": 53,
+    "p50": 1261,
+    "p90": 12999.5,
+    "p95": 14060,
+    "p99": 14136,
+    "max": 14137.9,
+    "cpuPercent": 0,
+    "memoryPercent": 99
+  },
+  "stage5_socket": {
+    "clientCount": 150,
+    "connectedCount": 150,
+    "connectionRate": 100,
+    "handshakeP50": 764,
+    "handshakeP95": 1480,
+    "messagesReceived": 0,
+    "errors": 0
+  },
+  "stage6_attendance": {
+    "studentCount": 150,
+    "wallTimeMs": 13211,
+    "successful": 150,
+    "failed": 0,
+    "p50": 6342.8,
+    "p95": 9450.5,
+    "p99": 9685,
+    "max": 9713,
+    "idempotentPass": true
+  },
+  "stage7_integrity": {
+    "dateStr": "2026-11-22",
+    "totalRecordsToday": 150,
+    "distinctStudentsCount": 150,
+    "duplicatesCount": 0,
+    "passed": true
+  }
+}

@@ -9,6 +9,8 @@ const {
   getAllStudents,
   adminUpdateStudentPassword,
   adminUpdateStudentProfile,
+  updateStudentAccessStatus,
+  getStudentAccessLogs
 } = require('../controllers/authController');
 const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
 
@@ -17,8 +19,10 @@ router.post('/login', loginUser);
 router.post('/logout', logoutUser);
 router.get('/profile', protect, getUserProfile);
 router.put('/profile', protect, updateUserProfile);
+router.get('/student-access-logs', protect, getStudentAccessLogs);
 router.get('/students', protect, mentorOrAdmin, getAllStudents);
 router.put('/students/:id/password', protect, mentorOrAdmin, adminUpdateStudentPassword);
+router.put('/students/:id/access-status', protect, mentorOrAdmin, updateStudentAccessStatus);
 router.put('/students/:id', protect, mentorOrAdmin, adminUpdateStudentProfile);
 
 module.exports = router;

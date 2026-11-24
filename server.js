@@ -25,7 +25,7 @@ const io = new Server(server, {
   cors: {
     origin: (origin, callback) => callback(null, true),
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-user-id', 'Accept', 'Cookie', 'Origin'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-user-id', 'x-request-id', 'X-Request-Id', 'Accept', 'Cookie', 'Origin'],
     credentials: true,
   }
 });
@@ -43,7 +43,8 @@ app.use((req, res, next) => {
   }
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, x-user-id, Accept, Cookie, Origin, Access-Control-Allow-Origin');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, x-user-id, x-request-id, X-Request-Id, Accept, Cookie, Origin, Access-Control-Allow-Origin');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id, X-Total-Count');
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -59,30 +60,42 @@ app.use(cors({
   origin: (origin, callback) => callback(null, true),
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-user-id', 'Accept', 'Cookie', 'Origin'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-user-id', 'x-request-id', 'X-Request-Id', 'Accept', 'Cookie', 'Origin'],
+  exposedHeaders: ['X-Request-Id', 'X-Total-Count'],
 }));
 
-// Live Traffic Telemetry Counter Middleware
-let globalRequestCount = 124;
-let requestCounterWindow = 18;
-let lastWindowReset = Date.now();
+const crypto = require('crypto');
+const metricsService = require('./utils/metricsService');
 
+// Request ID, Response Time & Structured Telemetry Logging Middleware
 app.use((req, res, next) => {
-  if (req.path.startsWith('/api')) {
-    globalRequestCount++;
-    requestCounterWindow++;
+  const startHrTime = process.hrtime.bigint();
 
-    if (Date.now() - lastWindowReset > 60000) {
-      requestCounterWindow = 1;
-      lastWindowReset = Date.now();
-    }
+  // Propagate incoming X-Request-Id or assign a unique UUID
+  const reqId = req.headers['x-request-id'] || crypto.randomUUID();
+  req.id = reqId;
+  res.setHeader('X-Request-Id', reqId);
 
-    app.set('liveTrafficStats', {
-      total: globalRequestCount,
-      rpm: requestCounterWindow,
-      lastUpdated: Date.now()
+  // Hook response completion to record latency and emit structured logs
+  res.on('finish', () => {
+    const endHrTime = process.hrtime.bigint();
+    const durationMs = Number(endHrTime - startHrTime) / 1e6;
+
+    // Record truthful operational metrics
+    const reqPath = req.originalUrl || req.path || '';
+    metricsService.recordRequest({
+      path: reqPath,
+      durationMs,
+      statusCode: res.statusCode
     });
-  }
+
+    // Structured logging: log all mutating requests, slow requests (>500ms), and non-probe application traffic
+    const isProbe = metricsService.isProbePath(reqPath);
+    if (!isProbe || res.statusCode >= 400 || durationMs > 500) {
+      console.log(`[REQ] ${reqId} ${req.method} ${reqPath} -> ${res.statusCode} (${durationMs.toFixed(1)}ms)`);
+    }
+  });
+
   next();
 });
 
@@ -97,6 +110,7 @@ const analyticsRoutes = require('./routes/analyticsRoutes');
 const attendanceRoutes = require('./routes/attendanceRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const chatRoutes = require('./routes/chatRoutes');
+const announcementRoutes = require('./routes/announcementRoutes');
 const leetcodeRoutes = require('./routes/leetcodeRoutes');
 const leaveRoutes = require('./routes/leaveRoutes');
 const publicRoutes = require('./routes/publicRoutes');
@@ -106,6 +120,8 @@ const trafficRoutes = require('./routes/trafficRoutes');
 const gamificationRoutes = require('./routes/gamificationRoutes');
 const noteRoutes = require('./routes/noteRoutes');
 const mentorRoutes = require('./routes/mentorRoutes');
+const monitorAccessRoutes = require('./routes/monitorAccessRoutes');
+const syllabusRoutes = require('./routes/syllabusRoutes');
 const path = require('path');
 
 app.use('/api/auth', authRoutes);
@@ -118,6 +134,7 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/announcements', announcementRoutes);
 app.use('/api/leetcode', leetcodeRoutes);
 app.use('/api/leaves', leaveRoutes);
 app.use('/api/public', publicRoutes);
@@ -127,16 +144,19 @@ app.use('/api/traffic', trafficRoutes);
 app.use('/api/gamification', gamificationRoutes);
 app.use('/api/notes', noteRoutes);
 app.use('/api/mentors', mentorRoutes);
+app.use('/api/monitor-access', monitorAccessRoutes);
+app.use('/api/syllabus', syllabusRoutes);
 
 // Custom Domain Proxy Route: Serves Cloudinary / MongoDB / Disk files under your domain name
 const Upload = require('./models/Upload');
-app.get('/uploads/:filename', async (req, res) => {
+const serveUploadedFile = async (req, res) => {
   try {
     const { filename } = req.params;
     
     const dbFile = await Upload.findOne({ filename });
     if (dbFile) {
-      res.setHeader('Content-Type', dbFile.contentType);
+      res.setHeader('Content-Type', dbFile.contentType || 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
 
       // 1. If stored on Cloudinary, proxy the file stream seamlessly under your custom domain
       if (dbFile.cloudinaryUrl) {
@@ -157,6 +177,7 @@ app.get('/uploads/:filename', async (req, res) => {
     // 3. Fallback to physical disk file (for backward compatibility)
     const filePath = path.join(__dirname, 'uploads', filename);
     if (fs.existsSync(filePath)) {
+      res.setHeader('Cache-Control', 'public, max-age=86400');
       return res.sendFile(filePath);
     }
 
@@ -166,11 +187,72 @@ app.get('/uploads/:filename', async (req, res) => {
     console.error('Error serving file:', error);
     res.status(500).send('Server Error');
   }
-});
+};
+
+app.get('/uploads/:filename', serveUploadedFile);
+app.get('/api/uploads/:filename', serveUploadedFile);
 
 // Root route
 app.get('/', (req, res) => {
   res.send('LMS API is running');
+});
+
+// Liveness probe (checks process responsiveness without dependencies)
+app.get(['/health/live', '/api/health/live', '/health/liveness', '/api/health/liveness'], (req, res) => {
+  res.status(200).json({
+    status: 'alive',
+    uptime: Math.floor(process.uptime()),
+    timestamp: Date.now()
+  });
+});
+
+// Readiness probe (verifies database dependency and reports basic operational telemetry)
+app.get(['/health/ready', '/api/health/ready', '/health/readiness', '/api/health/readiness'], (req, res) => {
+  const isDbReady = mongoose.connection.readyState === 1;
+  const metrics = metricsService.getSnapshot();
+  if (isDbReady) {
+    return res.status(200).json({
+      status: 'ready',
+      uptime: Math.floor(process.uptime()),
+      dependencies: { database: 'connected' },
+      timestamp: Date.now(),
+      cpuPercent: metrics.cpuPercent,
+      memoryPercent: metrics.memoryPercent,
+      appRequests: metrics.appRequests,
+      appRpm: metrics.appRpm,
+      avgProcessingLatencyMs: metrics.avgProcessingLatencyMs
+    });
+  } else {
+    return res.status(503).json({
+      status: 'not_ready',
+      uptime: Math.floor(process.uptime()),
+      dependencies: { database: 'disconnected' },
+      timestamp: Date.now(),
+      cpuPercent: metrics.cpuPercent,
+      memoryPercent: metrics.memoryPercent,
+      appRequests: metrics.appRequests,
+      appRpm: metrics.appRpm,
+      avgProcessingLatencyMs: metrics.avgProcessingLatencyMs
+    });
+  }
+});
+
+// Backward-compatible general health probe
+app.get(['/health', '/api/health'], (req, res) => {
+  const isDbReady = mongoose.connection.readyState === 1;
+  const metrics = metricsService.getSnapshot();
+  const statusCode = isDbReady ? 200 : 503;
+  res.status(statusCode).json({
+    status: isDbReady ? 'ok' : 'degraded',
+    uptime: Math.floor(process.uptime()),
+    ready: isDbReady,
+    timestamp: Date.now(),
+    cpuPercent: metrics.cpuPercent,
+    memoryPercent: metrics.memoryPercent,
+    appRequests: metrics.appRequests,
+    appRpm: metrics.appRpm,
+    avgProcessingLatencyMs: metrics.avgProcessingLatencyMs
+  });
 });
 
 const PORT = process.env.PORT || 3000;
@@ -191,9 +273,12 @@ const getISTDateStr = (date = new Date()) => {
   return `${year}-${month}-${day}`;
 };
 
-// Run every day at exactly 12:00 AM (midnight) for Attendance reset
+// Distributed background job coordinator
+const { runDistributedJob } = require('./utils/distributedJobRunner');
+
+// Run every day at exactly 12:00 AM (midnight) for Attendance reset (single instance lease)
 cron.schedule('0 0 * * *', async () => {
-  try {
+  await runDistributedJob('attendance_midnight_reset', 300000, 3600000, async () => {
     const now = new Date();
     const todayStr = getISTDateStr(now);
 
@@ -210,8 +295,6 @@ cron.schedule('0 0 * * *', async () => {
         record.sessionDurationSeconds += Math.floor(durationMs / 1000);
         record.checkOutTime = now;
         record.isActive = false;
-
-        // The user will need to manually check-in again for the new day
       }
 
       // Compute final status for the past day
@@ -219,7 +302,7 @@ cron.schedule('0 0 * * *', async () => {
         record.status = 'Leave';
       } else {
         const { getBatchHourLimits } = require('./controllers/attendanceController');
-        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(record.studentId);
+        const { requiredPresentHours, maxValidHours } = await getBatchHourLimits(record.studentId, record.dateStr, record.accessType);
         const hours = (record.sessionDurationSeconds || 0) / 3600;
         const minRequired = requiredPresentHours - (record.leaveHours || 0);
         if (hours >= minRequired && hours <= maxValidHours) {
@@ -233,15 +316,13 @@ cron.schedule('0 0 * * *', async () => {
 
       await record.save();
     }
-  } catch (error) {
-    console.error('Error running cron job for Attendance reset:', error);
-  }
+  });
 });
 
 
-// Leetcode Deadline Cron Job - runs every hour
+// Leetcode Deadline Cron Job - runs every hour (single instance lease)
 cron.schedule('0 * * * *', async () => {
-  try {
+  await runDistributedJob('leetcode_hourly_streaks', 300000, 1800000, async () => {
     const expiredProblems = await Leetcode.find({
       deadline: { $lt: new Date() },
       processed: false
@@ -264,35 +345,21 @@ cron.schedule('0 * * * *', async () => {
       problem.processed = true;
       await problem.save();
     }
-  } catch (error) {
-    console.error('Error running cron job for LeetCode streaks:', error);
-  }
+  });
 });
 
 // Self-ping to keep server awake on Render free tier
-const BackendServer = require('./models/BackendServer');
 const selfPing = () => {
-  // Render automatically injects RENDER_EXTERNAL_URL in environment variables
-  const envUrl = process.env.RENDER_EXTERNAL_URL || process.env.BACKEND_URL;
+  // Only self-ping when running in deployed production environment on Render
+  const envUrl = process.env.RENDER_EXTERNAL_URL;
+  if (!envUrl) return; // Do not self-ping remote instances in local development
   
   setInterval(async () => {
     try {
-      let targetUrl = envUrl;
-
-      // Fallback to primary server URL in DB if environment variable is not defined
-      if (!targetUrl) {
-        const primaryNode = await BackendServer.findOne({ isPrimary: true });
-        if (primaryNode && primaryNode.url && !primaryNode.url.includes('localhost')) {
-          targetUrl = primaryNode.url;
-        }
-      }
-
-      if (targetUrl) {
-        const cleanUrl = targetUrl.endsWith('/') ? targetUrl.slice(0, -1) : targetUrl;
-        const pingEndpoint = `${cleanUrl}/api/traffic/public-config`;
-        const res = await fetch(pingEndpoint);
-        console.log(`Self-ping to keep awake [${pingEndpoint}]: Status ${res.status}`);
-      }
+      const cleanUrl = envUrl.endsWith('/') ? envUrl.slice(0, -1) : envUrl;
+      const pingEndpoint = `${cleanUrl}/api/traffic/public-config`;
+      const res = await fetch(pingEndpoint);
+      console.log(`Self-ping to keep awake [${pingEndpoint}]: Status ${res.status}`);
     } catch (err) {
       console.error(`Self-ping keep-awake failed: ${err.message}`);
     }
@@ -302,16 +369,23 @@ const selfPing = () => {
 // Initiate self-pinging routine
 selfPing();
 
-// Auto-Checkout Routine: Runs every 60 seconds for active batches
-const { processBatchAutoCheckouts } = require('./controllers/attendanceController');
-setInterval(() => {
-  processBatchAutoCheckouts();
+// Auto-Checkout & Batch Lifecycle Routine: Runs every 60 seconds with distributed lock coordination across instances
+const { processBatchAutoCheckouts, autoCloseAllOldSessions } = require('./controllers/attendanceController');
+const { autoCloseExpiredBatches } = require('./controllers/batchController');
+setInterval(async () => {
+  await runDistributedJob('batch_auto_checkout', 55000, 45000, async () => {
+    await processBatchAutoCheckouts();
+    await autoCloseAllOldSessions();
+    await autoCloseExpiredBatches();
+  });
 }, 60000);
 
-// Auto Cloudinary Migration Routine
+// Auto Cloudinary Migration Routine (single execution across instances)
 const migrateFilesToCloudinary = require('./scripts/migrateToCloudinary');
-setTimeout(() => {
-  migrateFilesToCloudinary();
+setTimeout(async () => {
+  await runDistributedJob('cloudinary_migration', 600000, 86400000, async () => {
+    await migrateFilesToCloudinary();
+  });
 }, 5000);
 
 server.listen(PORT, () => {

@@ -27,11 +27,23 @@ const backendServerSchema = new mongoose.Schema({
   },
   cpuUsage: {
     type: Number,
-    default: 18
+    default: null
   },
   memoryUsage: {
     type: Number,
-    default: 32
+    default: null
+  },
+  avgProcessingLatencyMs: {
+    type: Number,
+    default: 0
+  },
+  totalRequests: {
+    type: Number,
+    default: 0
+  },
+  probeCount: {
+    type: Number,
+    default: 0
   },
   requestRate: {
     type: Number,
@@ -52,6 +64,22 @@ const backendServerSchema = new mongoose.Schema({
   isPrimary: {
     type: Boolean,
     default: false
+  },
+  consecutiveFailures: {
+    type: Number,
+    default: 0
+  },
+  consecutiveSuccesses: {
+    type: Number,
+    default: 0
+  },
+  lastHealthCheck: {
+    type: Date,
+    default: null
+  },
+  failureReason: {
+    type: String,
+    default: ''
   }
 }, {
   timestamps: true

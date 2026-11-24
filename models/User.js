@@ -128,12 +128,25 @@ const userSchema = new mongoose.Schema({
     amount: Number,
     reason: String,
     date: { type: Date, default: Date.now }
-  }]
+  }],
+
+  // ─── Account Access & Suspension Control ───
+  isBlocked: { type: Boolean, default: false },
+  blockReason: { type: String, default: '' },
+  blockedAt: { type: Date, default: null },
+  blockedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+
+  isSuspended: { type: Boolean, default: false },
+  suspendedUntil: { type: Date, default: null },
+  suspensionReason: { type: String, default: '' },
+  suspendedAt: { type: Date, default: null },
+  suspendedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
 }, {
   timestamps: true
 });
 
 userSchema.index({ role: 1 });
+userSchema.index({ isBlocked: 1, isSuspended: 1 });
 
 // Encrypt password using bcrypt
 userSchema.pre('save', async function() {

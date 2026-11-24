@@ -134,6 +134,13 @@ const parseExcelRow = (row) => {
     }
   }
 
+  if (percentage === null || percentage === 0) {
+    let maxFromRounds = roundScores.reduce((sum, r) => sum + (Number(r.maxMarks) || 0), 0);
+    if (maxFromRounds > 0 && totalMarks > 0) {
+      percentage = Math.round((totalMarks / maxFromRounds) * 10000) / 100;
+    }
+  }
+
   if (!grade) {
     grade = totalMarks > 0 ? 'Pass' : 'Fail';
   }
@@ -419,6 +426,10 @@ const saveMockDrive = async (req, res) => {
         const studentIdStr = item.studentId.toString();
         matchedStudentIds.add(studentIdStr);
 
+        const calcPct = (item.rowData.percentage && Number(item.rowData.percentage) > 0)
+          ? Number(item.rowData.percentage)
+          : (maxMarks > 0 ? Math.round(((Number(item.rowData.totalMarks) || 0) / maxMarks) * 10000) / 100 : 0);
+
         const scoreRecord = await MockDriveScore.create({
           mockDriveId: mockDrive._id,
           studentId: item.studentId,
@@ -429,7 +440,7 @@ const saveMockDrive = async (req, res) => {
           hr: item.rowData.hr,
           roundScores: item.rowData.roundScores || [],
           totalMarks: item.rowData.totalMarks,
-          percentage: item.rowData.percentage,
+          percentage: calcPct,
           grade: item.rowData.grade,
           attended: true
         });
@@ -562,7 +573,16 @@ const getStudentMockDriveScores = async (req, res) => {
       .populate('mockDriveId', 'title maxMarks date')
       .sort('-createdAt');
       
-    res.json(scores);
+    const formattedScores = scores.map(s => {
+      const doc = s.toObject();
+      const maxMarks = doc.mockDriveId?.maxMarks || 0;
+      if ((!doc.percentage || doc.percentage === 0) && doc.totalMarks > 0 && maxMarks > 0) {
+        doc.percentage = Math.round(((doc.totalMarks / maxMarks) * 100) * 100) / 100;
+      }
+      return doc;
+    });
+
+    res.json(formattedScores);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -593,7 +613,7 @@ const deleteMockDrive = async (req, res) => {
 // @access  Private/Admin
 const updateStudentScoreManually = async (req, res) => {
   try {
-    const { studentId, aptitude, mcq, coding, techHr, hr, totalMarks, percentage, grade, attended } = req.body;
+    const { studentId, aptitude, mcq, coding, techHr, hr, roundScores, totalMarks, percentage, grade, attended } = req.body;
     const mockDriveId = req.params.id;
 
     let scoreRecord = await MockDriveScore.findOne({ mockDriveId, studentId });
@@ -601,6 +621,9 @@ const updateStudentScoreManually = async (req, res) => {
       scoreRecord = new MockDriveScore({ mockDriveId, studentId });
     }
 
+    if (roundScores !== undefined && Array.isArray(roundScores)) {
+      scoreRecord.roundScores = roundScores;
+    }
     scoreRecord.aptitude = aptitude !== undefined ? aptitude : scoreRecord.aptitude;
     scoreRecord.mcq = mcq !== undefined ? mcq : scoreRecord.mcq;
     scoreRecord.coding = coding !== undefined ? coding : scoreRecord.coding;

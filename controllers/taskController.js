@@ -1,6 +1,9 @@
 const Task = require('../models/Task');
 const User = require('../models/User');
 const Submission = require('../models/Submission');
+const Enrollment = require('../models/Enrollment');
+const socketHandlers = require('../sockets/socketHandlers');
+const { invalidateStudentAnalyticsCache } = require('./analyticsController');
 
 // @desc    Create a task
 // @route   POST /api/tasks
@@ -23,6 +26,40 @@ const createTask = async (req, res) => {
       scheduledAt: scheduledAt || null,
       requiredLinks: requiredLinks || []
     });
+
+    // Invalidate student analytics cache immediately
+    invalidateStudentAnalyticsCache();
+
+    // Instant real-time task assignment notification to enrolled students
+    try {
+      const taskPayload = {
+        taskId: task._id,
+        title: task.title,
+        dueDate: task.dueDate,
+        maxMarks: task.maxMarks,
+        category: task.category,
+        batchId: task.batchId,
+        createdBy: req.user?.name || 'Administrator',
+        createdAt: task.createdAt
+      };
+
+      if (task.batchId) {
+        socketHandlers.emitToBatch(task.batchId.toString(), 'new-task-assigned', taskPayload);
+      } else {
+        socketHandlers.emitToAll('new-task-assigned', taskPayload);
+      }
+
+      // Also directly emit to each active/approved student in the batch
+      const enrollQuery = task.batchId ? { batchId: task.batchId, status: 'approved' } : { status: 'approved' };
+      const enrollments = await Enrollment.find(enrollQuery).select('studentId').lean();
+      enrollments.forEach(e => {
+        if (e.studentId) {
+          socketHandlers.emitToUser(e.studentId.toString(), 'new-task-assigned', taskPayload);
+        }
+      });
+    } catch (notifErr) {
+      console.warn('Real-time task notification error:', notifErr.message);
+    }
 
     res.status(201).json(task);
   } catch (error) {
@@ -136,6 +173,7 @@ const updateTask = async (req, res) => {
     });
 
     if (task) {
+      invalidateStudentAnalyticsCache();
       res.json(task);
     } else {
       res.status(404).json({ message: 'Task not found' });
@@ -154,6 +192,7 @@ const deleteTask = async (req, res) => {
 
     if (task) {
       await task.deleteOne();
+      invalidateStudentAnalyticsCache();
       res.json({ message: 'Task removed' });
     } else {
       res.status(404).json({ message: 'Task not found' });

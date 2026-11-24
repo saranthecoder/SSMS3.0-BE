@@ -11,6 +11,8 @@ const generateToken = (res, userId) => {
     sameSite: 'none', // Allow cross-site requests (Netlify -> Render)
     maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
   });
+
+  return token;
 };
 
 module.exports = generateToken;

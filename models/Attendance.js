@@ -26,6 +26,23 @@ const attendanceSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  accessType: {
+    type: String,
+    enum: ['on-site', 'wfh'],
+    default: 'on-site'
+  },
+  workHours: {
+    type: Number,
+    default: null
+  },
+  minRequiredHours: {
+    type: Number,
+    default: 8
+  },
+  maxValidHours: {
+    type: Number,
+    default: 10
+  },
   isActive: {
     type: Boolean,
     default: false
@@ -47,7 +64,10 @@ const attendanceSchema = new mongoose.Schema({
   timestamps: true
 });
 
-attendanceSchema.index({ studentId: 1, dateStr: 1 });
+attendanceSchema.index({ studentId: 1, dateStr: 1 }, { unique: true });
+attendanceSchema.index({ studentId: 1, isActive: 1, dateStr: 1 });
 attendanceSchema.index({ dateStr: 1 });
+attendanceSchema.index({ isActive: 1, dateStr: 1 });
+attendanceSchema.index({ dateStr: 1, isActive: 1 });
 
 module.exports = mongoose.model('Attendance', attendanceSchema);

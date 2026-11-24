@@ -44,6 +44,18 @@ const submissionSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   },
+  isLate: {
+    type: Boolean,
+    default: false
+  },
+  delayHours: {
+    type: Number,
+    default: 0
+  },
+  latePenalty: {
+    type: Number,
+    default: 0
+  },
   submittedLinks: [{
     label: { type: String, required: true },
     url: { type: String, required: false }
@@ -54,7 +66,8 @@ const submissionSchema = new mongoose.Schema({
 
 // A student should only have one submission per task
 submissionSchema.index({ taskId: 1, studentId: 1 }, { unique: true });
-submissionSchema.index({ studentId: 1 });
+submissionSchema.index({ studentId: 1, status: 1 });
+submissionSchema.index({ taskId: 1, status: 1 });
 submissionSchema.index({ submittedAt: -1 });
 submissionSchema.index({ createdAt: -1 });
 

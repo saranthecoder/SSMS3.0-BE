@@ -43,18 +43,28 @@ const createMentor = async (req, res) => {
 // @access  Private/Admin
 const getMentors = async (req, res) => {
   try {
+    const { batchId } = req.query;
     const mentors = await User.find({ role: 'mentor' }).select('-password').lean();
     
     // Attach assigned batches to each mentor
     const mentorsWithBatches = await Promise.all(
       mentors.map(async (m) => {
-        const assignedBatches = await Batch.find({ mentorId: m._id }).select('batchName status').lean();
+        const assignedBatches = await Batch.find({ 
+          $or: [{ mentorId: m._id }, { mentors: m._id }] 
+        }).select('batchName status').lean();
         return {
           ...m,
           assignedBatches
         };
       })
     );
+
+    if (batchId && batchId !== 'all') {
+      const filtered = mentorsWithBatches.filter(m => 
+        m.assignedBatches.some(b => b._id.toString() === batchId.toString())
+      );
+      return res.json(filtered);
+    }
 
     res.json(mentorsWithBatches);
   } catch (error) {

@@ -7,6 +7,7 @@ const Enrollment = require('../models/Enrollment');
 const Message = require('../models/Message');
 const Leave = require('../models/Leave');
 const Attendance = require('../models/Attendance');
+const StudentAccessLog = require('../models/StudentAccessLog');
 
 const getISTDateStr = (date = new Date()) => {
   const istTime = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
@@ -20,6 +21,7 @@ const getISTDateStr = (date = new Date()) => {
 // Schema: { [batchId]: { leaderboard: [...], timestamp: number } }
 const leaderboardCache = {};
 const CACHE_TTL_MS = 180000; // 3 minutes Cache TTL
+const leaderboardInFlight = new Map();
 
 const getLeaderboardData = async (batchId) => {
   const now = Date.now();
@@ -27,7 +29,14 @@ const getLeaderboardData = async (batchId) => {
     return leaderboardCache[batchId].leaderboard;
   }
 
-  // Find all approved students in the batch
+  const batchKey = batchId ? batchId.toString() : 'global';
+  if (leaderboardInFlight.has(batchKey)) {
+    return leaderboardInFlight.get(batchKey);
+  }
+
+  const computePromise = (async () => {
+    try {
+      // Find all approved students in the batch
   const enrollments = await Enrollment.find({ batchId, status: 'approved' })
     .populate('studentId', 'name profileImage leetcodeStreak equippedAvatar badges currentTitle profileBorder currentTheme currentNamecolor equippedPet equippedEffect coins level')
     .lean();
@@ -124,17 +133,36 @@ const getLeaderboardData = async (batchId) => {
     student.rank = index + 1;
   });
 
-  leaderboardCache[batchId] = {
-    leaderboard,
-    timestamp: now
-  };
+      leaderboardCache[batchId] = {
+        leaderboard,
+        timestamp: Date.now()
+      };
 
-  return leaderboard;
+      return leaderboard;
+    } finally {
+      leaderboardInFlight.delete(batchKey);
+    }
+  })();
+
+  leaderboardInFlight.set(batchKey, computePromise);
+  return computePromise;
 };
+
+const { getApprovedBatchIds } = require('../utils/studentBatchCache');
 
 // In-memory cache for student analytics to avoid heavy queries.
 const studentAnalyticsCache = {};
-const STUDENT_ANALYTICS_CACHE_TTL_MS = 120000; // 2 minutes Cache TTL
+const STUDENT_ANALYTICS_CACHE_TTL_MS = 30000; // 30s Cache TTL for fast responsiveness
+
+const invalidateStudentAnalyticsCache = (studentId = null) => {
+  if (studentId) {
+    const sId = studentId.toString();
+    delete studentAnalyticsCache[`${sId}_mini`];
+    delete studentAnalyticsCache[`${sId}_full`];
+  } else {
+    Object.keys(studentAnalyticsCache).forEach(k => delete studentAnalyticsCache[k]);
+  }
+};
 
 // @desc    Get student performance analytics
 // @route   GET /api/analytics/student/:studentId
@@ -155,9 +183,8 @@ const getStudentAnalytics = async (req, res) => {
     }
 
     if (isMini) {
-      // Get all enrollments for student (select only batchId)
-      const enrollments = await Enrollment.find({ studentId, status: 'approved' }).select('batchId').lean();
-      const batchIds = enrollments.map(e => e.batchId);
+      // Get all approved batch IDs from memory cache
+      const batchIds = await getApprovedBatchIds(studentId);
 
       const [
         totalTasks,
@@ -289,6 +316,7 @@ const getStudentAnalytics = async (req, res) => {
         console.error('Error adding gamification events to student notifications:', gemErr);
       }
 
+      notifications = Array.from(new Map(notifications.map(n => [n.id, n])).values());
       notifications.sort((a, b) => new Date(b.time) - new Date(a.time));
       notifications = notifications.slice(0, 10);
 
@@ -456,6 +484,7 @@ const getStudentAnalytics = async (req, res) => {
       }
     }
 
+    notifications = Array.from(new Map(notifications.map(n => [n.id, n])).values());
     notifications.sort((a, b) => new Date(b.time) - new Date(a.time));
     notifications = notifications.slice(0, 10);
 
@@ -797,8 +826,22 @@ const getAdminDashboardStats = async (req, res) => {
       });
     });
 
+    notifications = Array.from(new Map(notifications.map(n => [n.id, n])).values());
     notifications.sort((a, b) => new Date(b.time) - new Date(a.time));
     notifications = notifications.slice(0, 10);
+
+    // Unread recent messages count for admin/mentor badge
+    let recentChats = 0;
+    try {
+      const Message = require('../models/Message');
+      recentChats = await Message.countDocuments({
+        createdAt: { $gte: new Date(Date.now() - 7 * 24 * 3600 * 1000) },
+        readBy: { $ne: req.user._id },
+        senderId: { $ne: req.user._id }
+      });
+    } catch (msgErr) {
+      console.warn('Error counting recent chats for dashboard:', msgErr.message);
+    }
 
     const payload = {
       totalStudents,
@@ -810,7 +853,8 @@ const getAdminDashboardStats = async (req, res) => {
       notifications,
       pendingLeavesCount: pendingLeaves.length,
       joinRequestsCount: pendingEnrollmentsCount,
-      todayAttendance
+      todayAttendance,
+      recentChats
     };
 
     adminStatsCache[cacheKey] = {
@@ -853,7 +897,7 @@ const getBatchAnalytics = async (req, res) => {
 
 const getLeaderboard = async (req, res) => {
   try {
-    const batchId = req.params.batchId;
+    const batchId = req.params.batchId || req.query.batchId;
     const leaderboard = await getLeaderboardData(batchId);
     res.json(leaderboard);
   } catch (error) {
@@ -869,7 +913,8 @@ const getActivityLogs = async (req, res) => {
       leaves,
       enrollments,
       grades,
-      tasks
+      tasks,
+      accessLogs
     ] = await Promise.all([
       Submission.find().sort({ createdAt: -1 }).limit(50).populate('studentId', 'name rollNumber').populate('taskId', 'title').lean(),
       Attendance.find().sort({ createdAt: -1 }).limit(50).populate('studentId', 'name rollNumber').lean(),
@@ -882,7 +927,8 @@ const getActivityLogs = async (req, res) => {
           { path: 'taskId', select: 'title' }
         ]
       }).lean(),
-      Task.find().sort({ createdAt: -1 }).limit(30).populate('batchId', 'batchName').lean()
+      Task.find().sort({ createdAt: -1 }).limit(30).populate('batchId', 'batchName').lean(),
+      StudentAccessLog.find().sort({ createdAt: -1 }).limit(30).lean()
     ]);
 
     const logs = [];
@@ -972,6 +1018,21 @@ const getActivityLogs = async (req, res) => {
       });
     });
 
+    accessLogs.forEach(acc => {
+      const isRestore = acc.action === 'restore';
+      logs.push({
+        id: 'access_' + acc._id,
+        timestamp: acc.createdAt,
+        type: isRestore ? 'ACCESS RESTORED' : 'ACCESS RESTRICTION',
+        studentName: acc.studentName || 'Student',
+        rollNumber: acc.studentRollNumber || '',
+        message: isRestore
+          ? `${acc.performedByName} restored panel access for ${acc.studentName}`
+          : `${acc.performedByName} ${acc.action === 'block' ? 'blocked' : `suspended (${acc.durationHours || 24}h)`} ${acc.studentName}${acc.reason ? `: "${acc.reason}"` : ''}`,
+        icon: isRestore ? 'access_restore' : 'access_block'
+      });
+    });
+
     // Sort by timestamp descending
     logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
@@ -1005,5 +1066,6 @@ module.exports = {
   getLeaderboard,
   getActivityLogs,
   getLeaderboardData,
-  isStudentRankOne
+  isStudentRankOne,
+  invalidateStudentAnalyticsCache
 };

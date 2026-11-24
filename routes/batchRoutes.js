@@ -5,6 +5,7 @@ const {
   getBatches,
   getBatchById,
   updateBatch,
+  closeBatch,
   deleteBatch,
   getBatchReport,
   downloadStudentTemplate,
@@ -22,6 +23,9 @@ router.route('/template/excel')
 
 router.route('/fetch-google-sheet')
   .post(protect, mentorOrAdmin, fetchGoogleSheetData);
+
+router.route('/:id/close')
+  .put(protect, admin, closeBatch);
 
 router.route('/:id')
   .get(protect, getBatchById)

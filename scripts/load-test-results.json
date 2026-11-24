@@ -1,0 +1,118 @@
+{
+  "testA": {
+    "scenario": "Login Burst",
+    "count": 150,
+    "successRate": 100,
+    "p50": 10329.5,
+    "p95": 17621.5,
+    "p99": 18694.2,
+    "max": 18794.8,
+    "timeouts": 0,
+    "failed": 0
+  },
+  "testB": {
+    "scenario": "Dashboard Load",
+    "count": 150,
+    "totalRequests": 750,
+    "successRate": 2.8000000000000003,
+    "p50": 25189.6,
+    "p95": 25328.8,
+    "p99": 25338.1,
+    "max": 25339,
+    "rps": 29.5
+  },
+  "testC": {
+    "scenario": "Attendance Burst (10s)",
+    "count": 150,
+    "successRate": 0,
+    "p50": 15002.9,
+    "p95": 15003.9,
+    "p99": 15004.7,
+    "max": 15005.4,
+    "idempotencyPass": false
+  },
+  "testD": {
+    "scenario": "Group Chat / Socket.io",
+    "count": 150,
+    "connectedCount": 150,
+    "connectionRate": 100,
+    "handshakeP50": 3264,
+    "handshakeP95": 4133,
+    "messagesDelivered": 0,
+    "errors": 0
+  },
+  "testE": {
+    "scenario": "Announcements & Notes",
+    "count": 150,
+    "totalRequests": 300,
+    "successRate": 0,
+    "p50": 76.6,
+    "p95": 15040.4,
+    "p99": 15041.9,
+    "max": 15041.9
+  },
+  "testF": {
+    "scenario": "Mixed Real-World Load",
+    "count": 150,
+    "totalRequests": 150,
+    "successRate": 0,
+    "p50": 14855.6,
+    "p95": 14902.3,
+    "p99": 14906.4,
+    "max": 14907.3
+  },
+  "testG": [
+    {
+      "vuCount": 25,
+      "totalRequests": 100,
+      "p50": 5029.2,
+      "p95": 5043.3,
+      "p99": 5045.1,
+      "max": 5045.1,
+      "errorRate": 0,
+      "rps": 19.8,
+      "cpuPercent": 0,
+      "memoryPercent": 99
+    },
+    {
+      "vuCount": 50,
+      "totalRequests": 200,
+      "p50": 5057.8,
+      "p95": 5107.9,
+      "p99": 5110.2,
+      "max": 5110.8,
+      "errorRate": 0,
+      "rps": 39.1,
+      "cpuPercent": 0,
+      "memoryPercent": 100
+    },
+    {
+      "vuCount": 100,
+      "totalRequests": 400,
+      "p50": 5099.9,
+      "p95": 5169.7,
+      "p99": 5174.4,
+      "max": 5175.6,
+      "errorRate": 0,
+      "rps": 77,
+      "cpuPercent": 0,
+      "memoryPercent": 100
+    },
+    {
+      "vuCount": 150,
+      "totalRequests": 600,
+      "p50": 5149,
+      "p95": 5289,
+      "p99": 5297.4,
+      "max": 5298.5,
+      "errorRate": 0,
+      "rps": 112.7,
+      "cpuPercent": 0,
+      "memoryPercent": 100
+    }
+  ],
+  "integrity": {
+    "error": "Server selection timed out after 8000 ms",
+    "integrityPassed": false
+  }
+}

@@ -52,24 +52,73 @@ const getMyLeaves = async (req, res) => {
 
 // @desc    Get all leave requests
 // @route   GET /api/leaves
-// @access  Private/Admin
+// @access  Private/Admin/Mentor
 const getAllLeaves = async (req, res) => {
   try {
     let query = {};
+    const { batchId } = req.query;
+    const Batch = require('../models/Batch');
+    const Enrollment = require('../models/Enrollment');
+
+    let filterBatchIds = [];
+
     if (req.user.role === 'mentor') {
-      const Batch = require('../models/Batch');
-      const Enrollment = require('../models/Enrollment');
       const mentorBatches = await Batch.find({ mentorId: req.user._id }).select('_id').lean();
-      const mentorBatchIds = mentorBatches.map(b => b._id);
-      const enrollments = await Enrollment.find({ batchId: { $in: mentorBatchIds }, status: 'approved' }).select('studentId').lean();
+      const mentorBatchIds = mentorBatches.map(b => b._id.toString());
+      
+      if (batchId && batchId !== 'all') {
+        if (mentorBatchIds.includes(batchId.toString())) {
+          filterBatchIds = [batchId];
+        } else {
+          filterBatchIds = mentorBatchIds;
+        }
+      } else {
+        filterBatchIds = mentorBatchIds;
+      }
+    } else if (batchId && batchId !== 'all') {
+      filterBatchIds = [batchId];
+    }
+
+    if (filterBatchIds.length > 0) {
+      const enrollments = await Enrollment.find({ 
+        batchId: { $in: filterBatchIds }, 
+        status: 'approved' 
+      }).select('studentId').lean();
       const studentIds = enrollments.map(e => e.studentId);
       query.studentId = { $in: studentIds };
     }
 
     const leaves = await Leave.find(query)
-      .populate('studentId', 'name email rollNumber batch')
-      .sort({ createdAt: -1 });
-    res.json(leaves);
+      .populate('studentId', 'name email rollNumber')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Map student enrollments to attach batch info to each student's leave record
+    const allStudentIds = leaves.map(l => l.studentId?._id).filter(Boolean);
+    const studentEnrollments = await Enrollment.find({ 
+      studentId: { $in: allStudentIds }, 
+      status: 'approved' 
+    }).populate('batchId', 'batchName').lean();
+
+    const studentBatchMap = {};
+    studentEnrollments.forEach(e => {
+      if (e.studentId && e.batchId) {
+        const sId = e.studentId._id ? e.studentId._id.toString() : e.studentId.toString();
+        studentBatchMap[sId] = e.batchId;
+      }
+    });
+
+    const formattedLeaves = leaves.map(leave => {
+      if (leave.studentId) {
+        const sId = leave.studentId._id ? leave.studentId._id.toString() : leave.studentId.toString();
+        const batchInfo = studentBatchMap[sId] || null;
+        leave.studentId.batch = batchInfo;
+        leave.batchId = batchInfo ? batchInfo._id : null;
+      }
+      return leave;
+    });
+
+    res.json(formattedLeaves);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

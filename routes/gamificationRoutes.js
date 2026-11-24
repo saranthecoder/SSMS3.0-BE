@@ -20,7 +20,9 @@ const {
   getAdminShopCatalog,
   addShopItem,
   editShopItem,
-  deleteShopItem
+  deleteShopItem,
+  allocateCoinsAndXP,
+  getAdminGamificationEvents
 } = require('../controllers/gamificationController');
 
 // Status & Profile
@@ -42,11 +44,13 @@ router.post('/shop/unlock', protect, unlockShopItem);
 router.post('/shop/equip', protect, equipItem);
 router.post('/custom-avatar', protect, setCustomAvatar);
 
-// Admin Shop Management
+// Admin Shop Management & Allocation
 router.get('/admin/shop', protect, admin, getAdminShopCatalog);
 router.post('/admin/shop', protect, admin, addShopItem);
 router.put('/admin/shop/:id', protect, admin, editShopItem);
 router.delete('/admin/shop/:id', protect, admin, deleteShopItem);
+router.post('/admin/allocate-coins', protect, admin, allocateCoinsAndXP);
+router.get('/admin/events', protect, admin, getAdminGamificationEvents);
 
 // Missions
 router.get('/missions', protect, getMissions);
@@ -60,12 +64,16 @@ const {
   getFriends,
   sendFriendRequest,
   respondFriendRequest,
+  removeFriend,
+  searchStudents,
   shareCoins
 } = require('../controllers/socialController');
 
 router.get('/friends', protect, getFriends);
 router.post('/friends/request', protect, sendFriendRequest);
 router.post('/friends/respond', protect, respondFriendRequest);
+router.delete('/friends/:id', protect, removeFriend);
+router.get('/friends/search', protect, searchStudents);
 router.post('/friends/share-coins', protect, shareCoins);
 
 module.exports = router;

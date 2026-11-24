@@ -1,13 +1,23 @@
 const Note = require('../models/Note');
 const Enrollment = require('../models/Enrollment');
+const { getApprovedBatchIds } = require('../utils/studentBatchCache');
+
+const notesCache = new Map();
+const NOTES_CACHE_TTL_MS = 30000; // 30 seconds
 
 // @desc    Get notes (all for admin, batch-specific + global for students)
 // @route   GET /api/notes
 // @access  Private
 const getNotes = async (req, res) => {
   try {
+    const { batchId } = req.query;
+
     if (req.user.role === 'admin') {
-      const notes = await Note.find({})
+      let query = {};
+      if (batchId && batchId !== 'all') {
+        query.$or = [{ batchId }, { batchId: null }];
+      }
+      const notes = await Note.find(query)
         .populate('batchId', 'name batchName')
         .populate('uploadedBy', 'name')
         .sort({ createdAt: -1 });
@@ -19,30 +29,43 @@ const getNotes = async (req, res) => {
       const mentorBatches = await Batch.find({ mentorId: req.user._id }).select('_id');
       const mentorBatchIds = mentorBatches.map(b => b._id);
       
-      const notes = await Note.find({ batchId: { $in: mentorBatchIds } })
+      let query = { batchId: { $in: mentorBatchIds } };
+      if (batchId && batchId !== 'all') {
+        query = { batchId };
+      }
+
+      const notes = await Note.find(query)
         .populate('batchId', 'name batchName')
         .populate('uploadedBy', 'name')
         .sort({ createdAt: -1 });
       return res.json(notes);
     }
 
-    // If student, get approved enrollment batch
-    const enrollment = await Enrollment.findOne({ studentId: req.user._id, status: 'approved' });
-    const batchId = enrollment ? enrollment.batchId : null;
+    // If student, get approved enrollment batch from cache
+    const approvedBatchIds = await getApprovedBatchIds(req.user._id);
+    const studentBatchId = approvedBatchIds.length > 0 ? approvedBatchIds[0] : null;
+    const cacheKey = studentBatchId ? studentBatchId.toString() : 'global';
+
+    const cached = notesCache.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp) < NOTES_CACHE_TTL_MS) {
+      return res.json(cached.data);
+    }
 
     // Fetch notes matching student's batch OR global notes (batchId: null)
     const query = {
       $or: [
         { batchId: null },
-        ...(batchId ? [{ batchId }] : [])
+        ...(studentBatchId ? [{ batchId: studentBatchId }] : [])
       ]
     };
 
     const notes = await Note.find(query)
       .populate('batchId', 'name batchName')
       .populate('uploadedBy', 'name')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
 
+    notesCache.set(cacheKey, { data: notes, timestamp: Date.now() });
     res.json(notes);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -86,6 +109,7 @@ const addNote = async (req, res) => {
       .populate('batchId', 'name batchName')
       .populate('uploadedBy', 'name');
 
+    notesCache.clear();
     res.status(201).json(populatedNote);
   } catch (error) {
     res.status(400).json({ message: error.message });

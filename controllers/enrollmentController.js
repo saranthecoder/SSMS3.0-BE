@@ -39,7 +39,12 @@ const requestEnrollment = async (req, res) => {
 // @access  Private/Admin
 const getPendingEnrollments = async (req, res) => {
   try {
-    const enrollments = await Enrollment.find({ status: 'pending' })
+    const { batchId } = req.query;
+    let query = { status: 'pending' };
+    if (batchId && batchId !== 'all') {
+      query.batchId = batchId;
+    }
+    const enrollments = await Enrollment.find(query)
       .populate('studentId', 'name email profileImage')
       .populate('batchId', 'batchName');
 

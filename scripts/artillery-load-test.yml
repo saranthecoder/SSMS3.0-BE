@@ -1,0 +1,48 @@
+config:
+  target: "http://localhost:3000"
+  phases:
+    - name: "Phase 1: 25 Concurrent Users"
+      duration: 10
+      arrivalRate: 25
+    - name: "Phase 2: 50 Concurrent Users"
+      duration: 10
+      arrivalRate: 50
+    - name: "Phase 3: 100 Concurrent Users"
+      duration: 10
+      arrivalRate: 100
+    - name: "Phase 4: 200 Concurrent Users"
+      duration: 10
+      arrivalRate: 200
+  defaults:
+    headers:
+      User-Agent: "SSMS-Artillery-LoadTest/1.0"
+      Accept: "application/json"
+
+scenarios:
+  - name: "Student Health and Traffic Config Flow"
+    weight: 60
+    flow:
+      - get:
+          url: "/api/health"
+          expect:
+            - statusCode: 200
+      - get:
+          url: "/api/health/readiness"
+          expect:
+            - statusCode: 200
+      - get:
+          url: "/api/traffic/public-config"
+          expect:
+            - statusCode: 200
+
+  - name: "Student Telemetry and Liveness Flow"
+    weight: 40
+    flow:
+      - get:
+          url: "/api/health/liveness"
+          expect:
+            - statusCode: 200
+      - get:
+          url: "/api/traffic/public-config"
+          expect:
+            - statusCode: 200

@@ -13,7 +13,7 @@ const getISTDateStr = (date = new Date()) => {
 // @access  Private (Admin)
 const grantAccess = async (req, res) => {
   try {
-    const { studentIds, accessType, batchId } = req.body;
+    const { studentIds, accessType, batchId, workHours, minHours, maxHours } = req.body;
 
     if (!batchId) {
       return res.status(400).json({ message: 'batchId is required for batch-wise authorization.' });
@@ -30,11 +30,23 @@ const grantAccess = async (req, res) => {
 
     const dateStr = getISTDateStr();
 
+    const updateData = { accessType: type, grantedBy: req.user._id };
+    if (workHours !== undefined && workHours !== null && workHours !== '') {
+      updateData.workHours = Number(workHours);
+      updateData.minHours = Number(workHours);
+    }
+    if (minHours !== undefined && minHours !== null && minHours !== '') {
+      updateData.minHours = Number(minHours);
+    }
+    if (maxHours !== undefined && maxHours !== null && maxHours !== '') {
+      updateData.maxHours = Number(maxHours);
+    }
+
     const promises = studentIds.map(studentId => 
       CheckInAccess.findOneAndUpdate(
         { studentId, batchId, dateStr },
-        { accessType: type, grantedBy: req.user._id },
-        { upsert: true, new: true }
+        updateData,
+        { upsert: true, returnDocument: 'after' }
       )
     );
 
@@ -124,8 +136,17 @@ const getMyStatus = async (req, res) => {
     res.status(200).json({
       hasAccess: true,
       accessType: primaryGrant.accessType,
+      workHours: primaryGrant.workHours || primaryGrant.minHours || null,
+      minHours: primaryGrant.minHours || null,
+      maxHours: primaryGrant.maxHours || null,
       grantedAt: primaryGrant.createdAt,
-      grants: grants.map(g => ({ batchId: g.batchId, accessType: g.accessType }))
+      grants: grants.map(g => ({ 
+        batchId: g.batchId, 
+        accessType: g.accessType,
+        workHours: g.workHours,
+        minHours: g.minHours,
+        maxHours: g.maxHours
+      }))
     });
   } catch (error) {
     res.status(500).json({ message: error.message });

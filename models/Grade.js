@@ -11,6 +11,17 @@ const gradeSchema = new mongoose.Schema({
     type: Number,
     required: [true, 'Please add marks obtained']
   },
+  rawMarks: {
+    type: Number
+  },
+  latePenalty: {
+    type: Number,
+    default: 0
+  },
+  delayHours: {
+    type: Number,
+    default: 0
+  },
   feedback: {
     type: String,
     required: [true, 'Please add feedback']

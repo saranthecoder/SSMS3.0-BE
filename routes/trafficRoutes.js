@@ -5,6 +5,14 @@ const { protect, admin } = require('../middleware/authMiddleware');
 const BackendServer = require('../models/BackendServer');
 const TrafficConfig = require('../models/TrafficConfig');
 
+const metricsService = require('../utils/metricsService');
+const RenderHostingUsage = require('../models/RenderHostingUsage');
+const {
+  calculateUsageMetrics,
+  fetchRenderServicesIfConfigured,
+  getOrInitUsageDoc
+} = require('../utils/renderUsageService');
+
 // @route   GET /api/traffic/public-config
 // @desc    Get active servers and routing policy (Public endpoint for client Axios)
 // @access  Public
@@ -28,30 +36,42 @@ router.get('/public-config', async (req, res) => {
     }
 
     const config = await TrafficConfig.findOne();
-    const liveStats = req.app.get('liveTrafficStats') || { total: 145, rpm: 22 };
+    const liveMetrics = metricsService.getSnapshot();
+    const STALE_HEALTH_MS = 15 * 60 * 1000; // 15 minutes
+    const now = Date.now();
 
     res.json({
       policy: config ? config.policy : 'failover',
       cpuThreshold: config ? config.cpuThreshold : 80,
       manualSelectedServerId: config ? config.manualSelectedServerId : null,
       servers: servers.map(s => {
-        const isOnline = s.status === 'online';
-        const rpm = isOnline ? (s.url.includes('localhost') || s.isPrimary ? liveStats.rpm : Math.floor(liveStats.rpm * 0.4)) : 0;
-        const totalReqs = isOnline ? (s.url.includes('localhost') || s.isPrimary ? liveStats.total : Math.floor(liveStats.total * 0.4)) : 0;
+        const isStale = s.lastHealthCheck ? (now - new Date(s.lastHealthCheck).getTime() > STALE_HEALTH_MS) : true;
+        const effectiveStatus = isStale ? 'unknown' : s.status;
+        const isOnline = effectiveStatus === 'online';
+        const isCurrentInstance = s.url.includes('localhost') || s.isPrimary;
         
+        const rpm = isOnline && isCurrentInstance ? liveMetrics.appRpm : (s.reqPerMin || 0);
+        const appReqs = isOnline && isCurrentInstance ? liveMetrics.appRequests : (s.requestCount || 0);
+        const cpu = isOnline && isCurrentInstance ? liveMetrics.cpuPercent : (s.cpuUsage != null ? s.cpuUsage : null);
+        const mem = isOnline && isCurrentInstance ? liveMetrics.memoryPercent : (s.memoryUsage != null ? s.memoryUsage : null);
+        const processingLatency = isOnline && isCurrentInstance ? liveMetrics.avgProcessingLatencyMs : (s.avgProcessingLatencyMs || 0);
+
         return {
           id: s._id,
           _id: s._id,
           name: s.name,
           url: s.url,
           isPrimary: s.isPrimary,
-          status: s.status,
-          responseTime: s.responseTime,
-          cpuUsage: s.cpuUsage || 18,
-          memoryUsage: s.memoryUsage || 32,
-          requestCount: totalReqs,
-          reqPerMin: rpm,
-          activeConnections: s.activeConnections || (isOnline ? Math.floor(rpm * 1.5) + 3 : 0)
+          status: effectiveStatus,
+          isStale,
+          lastHealthCheck: s.lastHealthCheck,
+          responseTime: s.responseTime || 0,           // Backend probe round-trip latency (ms)
+          avgProcessingLatencyMs: processingLatency,   // Internal server execution latency (ms)
+          cpuUsage: cpu,
+          memoryUsage: mem,
+          requestCount: appReqs,                       // Actual student/app requests
+          reqPerMin: rpm,                              // Real 1-minute frequency
+          activeConnections: rpm
         };
       })
     });
@@ -61,33 +81,56 @@ router.get('/public-config', async (req, res) => {
 });
 
 // @route   GET /api/traffic/servers
-// @desc    Get all servers
+// @desc    Get all servers with operational metrics
 // @access  Private/Admin
 router.get('/servers', protect, admin, async (req, res) => {
   try {
     const servers = await BackendServer.find().sort({ isPrimary: -1, createdAt: 1 });
-    const liveStats = req.app.get('liveTrafficStats') || { total: 145, rpm: 22 };
+    const liveMetrics = metricsService.getSnapshot();
+    const STALE_HEALTH_MS = 15 * 60 * 1000;
+    const now = Date.now();
 
     const mappedServers = servers.map(s => {
-      const isOnline = s.isActive && s.status === 'online';
-      const rpm = isOnline ? (s.url.includes('localhost') || s.isPrimary ? liveStats.rpm : Math.floor(liveStats.rpm * 0.4)) : 0;
-      const totalReqs = isOnline ? (s.url.includes('localhost') || s.isPrimary ? liveStats.total : Math.floor(liveStats.total * 0.4)) : 0;
+      const isStale = s.lastHealthCheck ? (now - new Date(s.lastHealthCheck).getTime() > STALE_HEALTH_MS) : true;
+      const isOnline = s.isActive && s.status === 'online' && !isStale;
+      const isCurrentInstance = s.url.includes('localhost') || s.isPrimary;
       
+      const appRpm = isOnline && isCurrentInstance ? liveMetrics.appRpm : (s.reqPerMin || 0);
+      const appReqs = isOnline && isCurrentInstance ? liveMetrics.appRequests : (s.requestCount || 0);
+      const totalReqs = isOnline && isCurrentInstance ? liveMetrics.totalRequests : (s.totalRequests || appReqs);
+      const cpu = isOnline && isCurrentInstance ? liveMetrics.cpuPercent : (s.cpuUsage != null ? s.cpuUsage : null);
+      const mem = isOnline && isCurrentInstance ? liveMetrics.memoryPercent : (s.memoryUsage != null ? s.memoryUsage : null);
+      const processingLatency = isOnline && isCurrentInstance ? liveMetrics.avgProcessingLatencyMs : (s.avgProcessingLatencyMs || 0);
+
       return {
         ...s.toObject(),
-        status: s.isActive ? s.status : 'offline',
-        responseTime: s.isActive ? s.responseTime : 0,
-        cpuUsage: s.isActive ? s.cpuUsage : 0,
-        memoryUsage: s.isActive ? s.memoryUsage : 0,
-        requestCount: totalReqs,
-        reqPerMin: rpm,
-        activeConnections: isOnline ? Math.floor(rpm * 1.5) + 3 : 0
+        status: s.isActive ? (isStale ? 'unknown' : s.status) : 'offline',
+        isStale,
+        responseTime: s.responseTime || 0,           // Backend probe latency
+        avgProcessingLatencyMs: processingLatency,   // Server internal latency
+        cpuUsage: cpu,
+        memoryUsage: mem,
+        requestCount: appReqs,                       // Actual application/student requests
+        reqPerMin: appRpm,                           // Real student request frequency
+        totalRequests: totalReqs,                    // Total including probes
+        probeCount: isOnline && isCurrentInstance ? liveMetrics.probeRequests : 0
       };
     });
 
     res.json(mappedServers);
   } catch (error) {
     res.status(500).json({ message: 'Error fetching servers', error: error.message });
+  }
+});
+
+// @route   GET /api/traffic/metrics
+// @desc    Get comprehensive operational metrics for current host
+// @access  Private/Admin
+router.get('/metrics', protect, admin, (req, res) => {
+  try {
+    res.json(metricsService.getSnapshot());
+  } catch (error) {
+    res.status(500).json({ message: 'Error retrieving metrics', error: error.message });
   }
 });
 
@@ -115,8 +158,8 @@ router.post('/servers', protect, admin, async (req, res) => {
       isActive: isActive !== undefined ? isActive : true,
       status: 'unknown',
       responseTime: 0,
-      cpuUsage: 18,
-      memoryUsage: 32,
+      cpuUsage: null,
+      memoryUsage: null,
       isPrimary: false
     });
 
@@ -276,45 +319,95 @@ router.post('/ping', protect, admin, async (req, res) => {
     const requestsCount = config ? (config.requestsPerPing || 1) : 1;
     const pingResults = [];
 
-    // Calculate system CPU & memory
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const memPercent = Math.round(((totalMem - freeMem) / totalMem) * 100);
-    const cpus = os.cpus();
-    const loadAvg = os.loadavg()[0] || 0.15;
-    const cpuPercent = Math.min(100, Math.max(12, Math.round((loadAvg / (cpus.length || 1)) * 100)));
+    const localMetrics = metricsService.getSnapshot();
+    const FAILURE_THRESHOLD = 2;
+    const PROBE_TIMEOUT_MS = 5000; // 5s bounded timeout to accommodate remote hops
 
     for (const server of servers) {
       let totalLatency = 0;
       let successfulReqs = 0;
-      let lastStatus = 'offline';
+      let lastFailureReason = '';
+      let latestHealthData = null;
       const cleanUrl = server.url.trim().endsWith('/') ? server.url.trim().slice(0, -1) : server.url.trim();
 
       for (let i = 0; i < requestsCount; i++) {
         const startTime = Date.now();
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s timeout for Render cold-starts
+        let probeSucceeded = false;
+        let responseStatus = null;
+        let candidateError = null;
 
-          const response = await fetch(`${cleanUrl}/api/traffic/public-config`, { signal: controller.signal });
-          clearTimeout(timeoutId);
+        const candidateEndpoints = [
+          `${cleanUrl}/api/health/ready`,
+          `${cleanUrl}/api/health`,
+          `${cleanUrl}/api/traffic/public-config`,
+          `${cleanUrl}/`
+        ];
 
-          if (response.ok || response.status < 500) {
-            totalLatency += (Date.now() - startTime);
-            successfulReqs++;
-            lastStatus = 'online';
+        for (const endpoint of candidateEndpoints) {
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+            const response = await fetch(endpoint, {
+              signal: controller.signal,
+              headers: { 'Accept': 'application/json, text/plain, */*' }
+            });
+            clearTimeout(timeoutId);
+
+            if (response && response.ok) {
+              probeSucceeded = true;
+              totalLatency += (Date.now() - startTime);
+              successfulReqs++;
+              try {
+                const data = await response.json();
+                if (data && typeof data === 'object') {
+                  latestHealthData = data;
+                }
+              } catch {
+                // Non-JSON response is still a valid alive probe
+              }
+              break;
+            } else if (response) {
+              responseStatus = `HTTP ${response.status}`;
+            }
+          } catch (err) {
+            candidateError = err.name === 'AbortError' ? `Probe timed out (${PROBE_TIMEOUT_MS / 1000}s)` : err.message;
           }
-        } catch (err) {
-          console.error(`Ping attempt ${i + 1} to ${server.name} failed`, err);
+        }
+
+        if (!probeSucceeded) {
+          lastFailureReason = responseStatus || candidateError || 'Unknown response';
         }
       }
 
+      server.lastHealthCheck = new Date();
+      const isCurrentInstance = server.url.includes('localhost') || server.isPrimary;
+
       if (successfulReqs > 0) {
         const avgResponseTime = Math.round(totalLatency / successfulReqs);
-        server.status = 'online';
+        server.consecutiveSuccesses = (server.consecutiveSuccesses || 0) + 1;
+        server.consecutiveFailures = 0;
+        server.failureReason = '';
         server.responseTime = avgResponseTime;
-        server.cpuUsage = server.url.includes('localhost') ? cpuPercent : Math.floor(Math.random() * 25) + 15;
-        server.memoryUsage = server.url.includes('localhost') ? memPercent : Math.floor(Math.random() * 30) + 25;
+
+        if (isCurrentInstance) {
+          server.cpuUsage = localMetrics.cpuPercent;
+          server.memoryUsage = localMetrics.memoryPercent;
+          server.avgProcessingLatencyMs = localMetrics.avgProcessingLatencyMs;
+        } else if (latestHealthData && typeof latestHealthData.cpuPercent === 'number') {
+          server.cpuUsage = latestHealthData.cpuPercent;
+          server.memoryUsage = typeof latestHealthData.memoryPercent === 'number' ? latestHealthData.memoryPercent : null;
+          server.avgProcessingLatencyMs = typeof latestHealthData.avgProcessingLatencyMs === 'number' ? latestHealthData.avgProcessingLatencyMs : null;
+          if (typeof latestHealthData.appRequests === 'number') server.requestCount = latestHealthData.appRequests;
+          if (typeof latestHealthData.appRpm === 'number') server.reqPerMin = latestHealthData.appRpm;
+        } else {
+          server.cpuUsage = null;
+          server.memoryUsage = null;
+          server.avgProcessingLatencyMs = null;
+        }
+
+        // Immediately update status to online upon verified successful response
+        server.status = 'online';
+
         await server.save();
 
         pingResults.push({
@@ -322,15 +415,30 @@ router.post('/ping', protect, admin, async (req, res) => {
           _id: server._id.toString(),
           name: server.name,
           url: server.url,
-          status: 'online',
+          status: server.status,
           responseTime: avgResponseTime,
+          avgProcessingLatencyMs: server.avgProcessingLatencyMs,
+          consecutiveSuccesses: server.consecutiveSuccesses,
+          consecutiveFailures: 0,
+          lastHealthCheck: server.lastHealthCheck,
           cpuUsage: server.cpuUsage,
           memoryUsage: server.memoryUsage,
           requestsSent: requestsCount
         });
       } else {
-        server.status = 'offline';
-        server.responseTime = 0;
+        server.consecutiveFailures = (server.consecutiveFailures || 0) + 1;
+        server.consecutiveSuccesses = 0;
+        server.failureReason = lastFailureReason;
+        server.cpuUsage = null;
+        server.memoryUsage = null;
+        server.avgProcessingLatencyMs = null;
+
+        // Trip offline status once failure threshold is reached
+        if (server.consecutiveFailures >= FAILURE_THRESHOLD) {
+          server.status = 'offline';
+          server.responseTime = 0;
+        }
+
         await server.save();
 
         pingResults.push({
@@ -338,10 +446,15 @@ router.post('/ping', protect, admin, async (req, res) => {
           _id: server._id.toString(),
           name: server.name,
           url: server.url,
-          status: 'offline',
+          status: server.status,
+          failureReason: lastFailureReason,
           responseTime: 0,
-          cpuUsage: 0,
-          memoryUsage: 0,
+          avgProcessingLatencyMs: null,
+          consecutiveFailures: server.consecutiveFailures,
+          consecutiveSuccesses: 0,
+          lastHealthCheck: server.lastHealthCheck,
+          cpuUsage: null,
+          memoryUsage: null,
           requestsSent: requestsCount
         });
       }
@@ -349,6 +462,131 @@ router.post('/ping', protect, admin, async (req, res) => {
     res.json(pingResults);
   } catch (error) {
     res.status(500).json({ message: 'Error performing ping checks', error: error.message });
+  }
+});
+
+// @route   GET /api/traffic/render-usage
+// @desc    Get Render hosting usage metrics, remaining free hours, warnings, and services
+// @access  Private/Admin
+router.get('/render-usage', protect, admin, async (req, res) => {
+  try {
+    const doc = await getOrInitUsageDoc();
+    const serviceResult = await fetchRenderServicesIfConfigured(doc, false);
+    const metrics = calculateUsageMetrics(doc);
+
+    res.json({
+      metrics,
+      renderServices: serviceResult.services,
+      hasApiKey: serviceResult.hasApiKey,
+      isLiveApi: serviceResult.isLiveApi,
+      apiError: serviceResult.error,
+      billingDashboardUrl: 'https://dashboard.render.com/billing'
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error retrieving hosting usage metrics', error: error.message });
+  }
+});
+
+// @route   POST /api/traffic/render-usage
+// @desc    Update observed usage and free limits manually from Render billing dashboard
+// @access  Private/Admin
+router.post('/render-usage', protect, admin, async (req, res) => {
+  try {
+    const {
+      workspaceAllowanceHours,
+      consumedHours,
+      bandwidthLimitGB,
+      bandwidthConsumedGB,
+      buildMinutesLimit,
+      buildMinutesConsumed,
+      warningThresholds
+    } = req.body;
+
+    const doc = await getOrInitUsageDoc();
+
+    if (workspaceAllowanceHours !== undefined) {
+      const val = Number(workspaceAllowanceHours);
+      if (isNaN(val) || val < 0) {
+        return res.status(400).json({ message: 'Workspace allowance hours must be a non-negative number.' });
+      }
+      doc.workspaceAllowanceHours = val;
+    }
+
+    if (consumedHours !== undefined) {
+      const val = Number(consumedHours);
+      if (isNaN(val) || val < 0) {
+        return res.status(400).json({ message: 'Consumed hours must be a non-negative number.' });
+      }
+      doc.consumedHours = val;
+    }
+
+    if (bandwidthLimitGB !== undefined) {
+      const val = Number(bandwidthLimitGB);
+      if (!isNaN(val) && val >= 0) doc.bandwidthLimitGB = val;
+    }
+
+    if (bandwidthConsumedGB !== undefined) {
+      const val = Number(bandwidthConsumedGB);
+      if (!isNaN(val) && val >= 0) doc.bandwidthConsumedGB = val;
+    }
+
+    if (buildMinutesLimit !== undefined) {
+      const val = Number(buildMinutesLimit);
+      if (!isNaN(val) && val >= 0) doc.buildMinutesLimit = val;
+    }
+
+    if (buildMinutesConsumed !== undefined) {
+      const val = Number(buildMinutesConsumed);
+      if (!isNaN(val) && val >= 0) doc.buildMinutesConsumed = val;
+    }
+
+    if (Array.isArray(warningThresholds) && warningThresholds.length > 0) {
+      doc.warningThresholds = warningThresholds.map(Number).filter(n => !isNaN(n) && n > 0 && n <= 100);
+    }
+
+    doc.lastManualUpdate = new Date();
+    doc.lastUpdatedBy = req.user._id;
+    doc.lastUpdatedByName = req.user.name || 'Admin';
+    doc.dataSource = 'manual_entry';
+
+    await doc.save();
+
+    const serviceResult = await fetchRenderServicesIfConfigured(doc, false);
+    const metrics = calculateUsageMetrics(doc);
+
+    res.json({
+      message: 'Render hosting usage and free limits updated successfully.',
+      metrics,
+      renderServices: serviceResult.services,
+      hasApiKey: serviceResult.hasApiKey,
+      isLiveApi: serviceResult.isLiveApi,
+      apiError: serviceResult.error,
+      billingDashboardUrl: 'https://dashboard.render.com/billing'
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error updating hosting usage metrics', error: error.message });
+  }
+});
+
+// @route   POST /api/traffic/render-usage/refresh
+// @desc    Force refresh Render services list and recalculate metrics
+// @access  Private/Admin
+router.post('/render-usage/refresh', protect, admin, async (req, res) => {
+  try {
+    const doc = await getOrInitUsageDoc();
+    const serviceResult = await fetchRenderServicesIfConfigured(doc, true); // Force refresh
+    const metrics = calculateUsageMetrics(doc);
+
+    res.json({
+      metrics,
+      renderServices: serviceResult.services,
+      hasApiKey: serviceResult.hasApiKey,
+      isLiveApi: serviceResult.isLiveApi,
+      apiError: serviceResult.error,
+      billingDashboardUrl: 'https://dashboard.render.com/billing'
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error refreshing hosting usage', error: error.message });
   }
 });
 

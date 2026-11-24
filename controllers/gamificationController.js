@@ -79,9 +79,9 @@ const getGamificationStatus = async (req, res) => {
       totalProblemsSolved: user.totalProblemsSolved || user.totalLeetcodeSubmissions || 0,
       treasureChests: (user.treasureChests || []).filter(c => !c.opened),
       spinTickets: user.spinTickets || 0,
-      canClaimDailyLogin: user.role === 'admin' ? true : (!isSameDay(user.lastLoginReward, new Date()) && hasCheckedInToday),
+      canClaimDailyLogin: (user.role === 'admin' || user.role === 'mentor') ? true : !isSameDay(user.lastLoginReward, new Date()),
       hasCheckedInToday,
-      canSpin: user.role === 'admin' ? true : (!isSameDay(user.lastDailySpinDate, new Date()) || (user.spinTickets || 0) > 0),
+      canSpin: (user.role === 'admin' || user.role === 'mentor') ? true : (!isSameDay(user.lastDailySpinDate, new Date()) || (user.spinTickets || 0) > 0),
       weeklyXP: user.weeklyXP || 0,
       monthlyXP: user.monthlyXP || 0,
       isRankOne,
@@ -108,18 +108,38 @@ const claimDailyLogin = async (req, res) => {
 
     const Attendance = require('../models/Attendance');
     const todayStr = getISTDateStr();
-    const isAdmin = user.role === 'admin';
+    const isAdmin = user.role === 'admin' || user.role === 'mentor';
     const todayCheckIn = await Attendance.findOne({ studentId: user._id, dateStr: todayStr });
-    if (!todayCheckIn && !isAdmin) {
-      return res.status(400).json({ message: 'Please check in for attendance first before claiming your daily reward!' });
-    }
+    const hasCheckedInToday = !!todayCheckIn;
 
     if (isSameDay(user.lastLoginReward, now) && !isAdmin) {
       return res.status(400).json({ message: 'Already claimed today', alreadyClaimed: true });
     }
 
+    // Atomic claim guard: atomically claim today's slot to prevent concurrent duplicate rewards
+    let previousLastReward = user.lastLoginReward;
+    if (!isAdmin) {
+      const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const claimLock = await User.findOneAndUpdate(
+        {
+          _id: user._id,
+          $or: [
+            { lastLoginReward: { $exists: false } },
+            { lastLoginReward: null },
+            { lastLoginReward: { $lt: startOfToday } }
+          ]
+        },
+        { $set: { lastLoginReward: now } },
+        { returnDocument: 'before' }
+      );
+      if (!claimLock) {
+        return res.status(400).json({ message: 'Already claimed today', alreadyClaimed: true });
+      }
+      previousLastReward = claimLock.lastLoginReward;
+    }
+
     // Check streak continuity
-    if (isYesterday(user.lastLoginReward)) {
+    if (isYesterday(previousLastReward)) {
       user.dailyLoginStreak = (user.dailyLoginStreak || 0) + 1;
     } else {
       user.dailyLoginStreak = 1; // Reset streak
@@ -128,8 +148,12 @@ const claimDailyLogin = async (req, res) => {
     const dayIndex = ((user.dailyLoginStreak - 1) % 7); // 0-6 cyclic
     const reward = DAILY_LOGIN_REWARDS[dayIndex];
 
-    const coinsAwarded = awardCoinsWithCap(user, reward.coins, 'Daily login reward');
-    const xpResult = awardXPWithCap(user, reward.xp, 'Daily login reward');
+    // Award base reward + bonus if student also completed physical check-in today
+    let bonusCoins = hasCheckedInToday ? 15 : 0;
+    let bonusXP = hasCheckedInToday ? 30 : 0;
+
+    const coinsAwarded = awardCoinsWithCap(user, reward.coins + bonusCoins, `Daily login reward${hasCheckedInToday ? ' (+ Attendance Bonus)' : ''}`);
+    const xpResult = awardXPWithCap(user, reward.xp + bonusXP, `Daily login reward${hasCheckedInToday ? ' (+ Attendance Bonus)' : ''}`);
 
     user.lastLoginReward = now;
 
@@ -195,15 +219,51 @@ const dailySpin = async (req, res) => {
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     const now = new Date();
-    const usedTicket = isSameDay(user.lastDailySpinDate, now) && user.role !== 'admin';
+    const isFreeDailySpin = !isSameDay(user.lastDailySpinDate, now) || user.role === 'admin' || user.role === 'mentor';
 
-    if (usedTicket && (user.spinTickets || 0) <= 0) {
-      return res.status(400).json({ message: 'No spins available. Come back tomorrow!', canSpin: false });
-    }
+    // Atomic consumption guard to prevent race conditions during spins
+    if (user.role !== 'admin' && user.role !== 'mentor') {
+      if (isFreeDailySpin) {
+        const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const spinLock = await User.findOneAndUpdate(
+          {
+            _id: user._id,
+            $or: [
+              { lastDailySpinDate: { $exists: false } },
+              { lastDailySpinDate: null },
+              { lastDailySpinDate: { $lt: startOfToday } }
+            ]
+          },
+          { $set: { lastDailySpinDate: now } },
+          { returnDocument: 'before' }
+        );
 
-    // Use ticket or mark daily free spin
-    if (usedTicket) {
-      user.spinTickets -= 1;
+        if (!spinLock) {
+          // Free spin already consumed concurrently; try using a ticket
+          const ticketLock = await User.findOneAndUpdate(
+            { _id: user._id, spinTickets: { $gt: 0 } },
+            { $inc: { spinTickets: -1 } },
+            { returnDocument: 'after' }
+          );
+          if (!ticketLock) {
+            return res.status(400).json({ message: 'No spins available. Come back tomorrow!', canSpin: false });
+          }
+          user.spinTickets = ticketLock.spinTickets;
+        } else {
+          user.lastDailySpinDate = now;
+        }
+      } else {
+        // Daily free spin used; atomically consume a ticket
+        const ticketLock = await User.findOneAndUpdate(
+          { _id: user._id, spinTickets: { $gt: 0 } },
+          { $inc: { spinTickets: -1 } },
+          { returnDocument: 'after' }
+        );
+        if (!ticketLock) {
+          return res.status(400).json({ message: 'No spins available. Come back tomorrow!', canSpin: false });
+        }
+        user.spinTickets = ticketLock.spinTickets;
+      }
     } else {
       user.lastDailySpinDate = now;
     }
@@ -363,7 +423,7 @@ const buyChestEndpoint = async (req, res) => {
       Legendary: 5000
     };
 
-    const cost = user.role === 'admin' ? 0 : prices[chestType];
+    const cost = (user.role === 'admin' || user.role === 'mentor') ? 0 : prices[chestType];
     if (!cost && cost !== 0) {
       return res.status(400).json({ message: 'Invalid chest type' });
     }
@@ -482,13 +542,13 @@ const getShopCatalog = async (req, res) => {
     const userBadges = new Set((user?.badges || []).map(b => b.name));
 
     const catalog = items.map(item => {
-      let isUnlocked = (unlockedSets[item.category] || new Set()).has(item.value) || (item.cost === 0 && !item.achievementRequired) || user.role === 'admin';
+      let isUnlocked = (unlockedSets[item.category] || new Set()).has(item.value) || (item.cost === 0 && !item.achievementRequired) || user.role === 'admin' || user.role === 'mentor';
       
       if (item.achievementRequired) {
-        isUnlocked = userBadges.has(item.achievementRequired) || user.role === 'admin';
+        isUnlocked = userBadges.has(item.achievementRequired) || user.role === 'admin' || user.role === 'mentor';
       }
 
-      const cost = user.role === 'admin' ? 0 : item.cost;
+      const cost = (user.role === 'admin' || user.role === 'mentor') ? 0 : item.cost;
 
       return {
         ...item,
@@ -522,7 +582,7 @@ const unlockShopItem = async (req, res) => {
     const user = await User.findById(req.user._id);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const isAdmin = user.role === 'admin';
+    const isAdmin = user.role === 'admin' || user.role === 'mentor';
 
     // Verify achievement requirement
     if (item.achievementRequired && !isAdmin) {
@@ -637,12 +697,26 @@ const equipItem = async (req, res) => {
       }
     }
 
-    // Check if unlocked in user arrays
-    const isUnlockedInArray = (user[mapping.unlockArray] || []).includes(value);
-
     // Find the item in the database to verify if it is free or earned via achievements
-    const shopItem = await ShopItem.findOne({ category, value });
+    const mongoose = require('mongoose');
+    const shopItem = await ShopItem.findOne({ 
+      category, 
+      $or: [
+        { value }, 
+        { imageUrl: value },
+        { name: value },
+        ...(mongoose.isValidObjectId(value) ? [{ _id: value }] : [])
+      ] 
+    });
     const isFree = shopItem && shopItem.cost === 0 && !shopItem.achievementRequired;
+
+    // Check if unlocked in user arrays
+    const isUnlockedInArray = (user[mapping.unlockArray] || []).includes(value) ||
+      (shopItem && (
+        (user[mapping.unlockArray] || []).includes(shopItem.value) ||
+        (user[mapping.unlockArray] || []).includes(shopItem.imageUrl) ||
+        (user[mapping.unlockArray] || []).includes(shopItem._id.toString())
+      ));
 
     let hasAchievement = false;
     if (shopItem && shopItem.achievementRequired) {
@@ -653,10 +727,12 @@ const equipItem = async (req, res) => {
       return res.status(400).json({ message: 'Item not unlocked yet' });
     }
 
-    user[mapping.field] = value;
+    // Equip the resolved value (prefer imageUrl for avatar if value is blank/different)
+    const equipValue = (category === 'avatar' && shopItem?.imageUrl) ? shopItem.imageUrl : value;
+    user[mapping.field] = equipValue;
     await user.save();
 
-    res.json({ success: true, message: `${category} equipped!`, equipped: value });
+    res.json({ success: true, message: `${category} equipped!`, equipped: equipValue });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -785,7 +861,19 @@ const getLeaderboard = async (req, res) => {
       default:           sortField = { points: -1 }; break;
     }
 
-    const students = await User.find({ role: 'student' })
+    let studentFilter = { role: 'student' };
+    const { batchId } = req.query;
+    if (batchId && batchId !== 'all') {
+      const Enrollment = require('../models/Enrollment');
+      const enrollments = await Enrollment.find({ 
+        batchId, 
+        status: { $regex: /^approved$/i } 
+      }).select('studentId').lean();
+      const studentIds = enrollments.map(e => e.studentId);
+      studentFilter._id = { $in: studentIds };
+    }
+
+    const students = await User.find(studentFilter)
       .select('name equippedAvatar currentTitle profileBorder currentNamecolor equippedPet equippedEffect league level coins points totalLeetcodeSubmissions attendanceStreak weeklyXP monthlyXP badges')
       .sort(sortField)
       .limit(limit)
@@ -1012,6 +1100,9 @@ const editShopItem = async (req, res) => {
       return res.status(404).json({ message: 'Shop item not found' });
     }
 
+    const oldImageUrl = item.imageUrl;
+    const oldValue = item.value;
+
     const updatedFields = { ...req.body };
     delete updatedFields._id;
     delete updatedFields.__v;
@@ -1025,7 +1116,46 @@ const editShopItem = async (req, res) => {
       }
     });
 
+    // If imageUrl is updated, ensure both imageUrl and value are synced for avatars/pets
+    if (updatedFields.imageUrl && (item.category === 'avatar' || item.category === 'pet')) {
+      item.imageUrl = updatedFields.imageUrl;
+      if (!updatedFields.value || updatedFields.value === oldValue) {
+        item.value = updatedFields.imageUrl;
+      }
+    }
+
     const updatedItem = await item.save();
+
+    // Retroactive update: If avatar or pet photo was changed, sync for students who equipped it
+    if (updatedFields.imageUrl && (item.category === 'avatar' || item.category === 'pet')) {
+      const newImg = updatedFields.imageUrl;
+      const targets = [oldImageUrl, oldValue].filter(Boolean);
+      
+      if (targets.length > 0) {
+        if (item.category === 'avatar') {
+          // Update equipped avatar for all users who had the old avatar equipped
+          await User.updateMany(
+            { equippedAvatar: { $in: targets } },
+            { $set: { equippedAvatar: newImg } }
+          );
+          // Also update in unlockedAvatars so they don't lose unlock status
+          await User.updateMany(
+            { unlockedAvatars: { $in: targets } },
+            { $addToSet: { unlockedAvatars: newImg } }
+          );
+        } else if (item.category === 'pet') {
+          await User.updateMany(
+            { equippedPet: { $in: targets } },
+            { $set: { equippedPet: newImg } }
+          );
+          await User.updateMany(
+            { unlockedPets: { $in: targets } },
+            { $addToSet: { unlockedPets: newImg } }
+          );
+        }
+      }
+    }
+
     res.json(updatedItem);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -1044,6 +1174,124 @@ const deleteShopItem = async (req, res) => {
     }
 
     res.json({ message: 'Shop item deleted successfully', id });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Admin manual coin and XP allocation (single student or entire batch)
+// @route   POST /api/gamification/admin/allocate-coins
+// @access  Private/Admin
+const allocateCoinsAndXP = async (req, res) => {
+  try {
+    const { targetType, studentId, batchId, coins = 0, xp = 0, reason } = req.body;
+
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ message: 'Please provide a valid reason or note for this allocation.' });
+    }
+
+    const coinNum = parseInt(coins, 10) || 0;
+    const xpNum = parseInt(xp, 10) || 0;
+
+    if (coinNum === 0 && xpNum === 0) {
+      return res.status(400).json({ message: 'Please specify coins or XP to allocate.' });
+    }
+
+    let affectedStudents = [];
+
+    if (targetType === 'single') {
+      if (!studentId) return res.status(400).json({ message: 'Please select a student' });
+      const student = await User.findById(studentId);
+      if (!student) return res.status(404).json({ message: 'Student not found' });
+      affectedStudents = [student];
+    } else if (targetType === 'batch') {
+      if (!batchId) return res.status(400).json({ message: 'Please select a batch' });
+      const Enrollment = require('../models/Enrollment');
+      const enrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId');
+      const studentIds = enrollments.map(e => e.studentId);
+      affectedStudents = await User.find({ 
+        $or: [
+          { _id: { $in: studentIds } },
+          { batchId: batchId, role: 'student' }
+        ]
+      });
+      if (affectedStudents.length === 0) {
+        return res.status(400).json({ message: 'No students found enrolled in the selected batch.' });
+      }
+    } else {
+      return res.status(400).json({ message: 'Invalid target type. Must be "single" or "batch".' });
+    }
+
+    const { awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges } = require('../utils/gamification');
+
+    const updatePromises = affectedStudents.map(async (student) => {
+      if (coinNum > 0) {
+        awardCoinsWithCap(student, coinNum, `Admin Allocation: ${reason.trim()}`, true);
+      } else if (coinNum < 0) {
+        student.coins = Math.max(0, (student.coins || 0) + coinNum);
+        addRewardHistory(student, 'deduction', coinNum, `Admin Deduction: ${reason.trim()}`);
+      }
+
+      if (xpNum > 0) {
+        awardXPWithCap(student, xpNum, `Admin Allocation: ${reason.trim()}`, true);
+      } else if (xpNum < 0) {
+        student.points = Math.max(0, (student.points || 0) + xpNum);
+        addRewardHistory(student, 'xp_deduction', xpNum, `Admin Deduction: ${reason.trim()}`);
+      }
+
+      checkAndAwardBadges(student);
+      await student.save();
+
+      // Log Gamification Event
+      await GamificationEvent.create({
+        userId: student._id,
+        eventType: coinNum >= 0 ? 'coins_earned' : 'coins_spent',
+        coinsChange: coinNum,
+        xpChange: xpNum,
+        reason: `Admin Allocation (${req.user?.name || 'Admin'}): ${reason.trim()}`,
+        metadata: {
+          allocatedBy: req.user?._id,
+          targetType,
+          batchId: batchId || null
+        }
+      });
+
+      return {
+        _id: student._id,
+        name: student.name,
+        coins: student.coins,
+        points: student.points,
+        level: student.level,
+        league: student.league
+      };
+    });
+
+    const results = await Promise.all(updatePromises);
+
+    res.json({
+      success: true,
+      message: `Successfully allocated ${coinNum >= 0 ? `+${coinNum}` : coinNum} Coins and ${xpNum >= 0 ? `+${xpNum}` : xpNum} XP to ${results.length} student(s).`,
+      count: results.length,
+      students: results
+    });
+  } catch (error) {
+    console.error('Error allocating coins:', error);
+    res.status(500).json({ message: error.message || 'Failed to allocate coins.' });
+  }
+};
+
+// @desc    Get gamification audit events
+// @route   GET /api/gamification/admin/events
+// @access  Private/Admin
+const getAdminGamificationEvents = async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 50;
+    const events = await GamificationEvent.find()
+      .populate('userId', 'name rollNumber email profileImage equippedAvatar batchId')
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+    res.json(events);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -1069,5 +1317,7 @@ module.exports = {
   getAdminShopCatalog,
   addShopItem,
   editShopItem,
-  deleteShopItem
+  deleteShopItem,
+  allocateCoinsAndXP,
+  getAdminGamificationEvents
 };

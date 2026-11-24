@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon --ignore uploads/ server.js"
+    "dev": "nodemon --ignore uploads/ server.js",
+    "test": "node --test utils/metricsService.test.js utils/performance.test.js utils/socketAndJobs.test.js utils/renderUsageService.test.js utils/monitorAccess.test.js utils/studentAccessControl.test.js"
   },
   "keywords": [],
   "author": "",

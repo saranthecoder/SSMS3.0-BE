@@ -6,6 +6,11 @@ const messageSchema = new mongoose.Schema({
     ref: 'Batch',
     default: null
   },
+  groupId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChatGroup',
+    default: null
+  },
   senderId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -30,7 +35,6 @@ const messageSchema = new mongoose.Schema({
   },
   attachmentType: {
     type: String,
-    enum: ['image', 'pdf', 'document', 'other', ''],
     default: ''
   },
   isAnnouncement: {
@@ -41,6 +45,10 @@ const messageSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  deliveredTo: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
   readBy: [{
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
@@ -50,6 +58,11 @@ const messageSchema = new mongoose.Schema({
 });
 
 messageSchema.index({ batchId: 1, createdAt: 1 });
+messageSchema.index({ groupId: 1, createdAt: 1 });
 messageSchema.index({ senderId: 1, recipientId: 1, createdAt: 1 });
+messageSchema.index({ recipientId: 1, senderId: 1, createdAt: 1 });
+messageSchema.index({ recipientId: 1, readBy: 1 });
+messageSchema.index({ groupId: 1, readBy: 1 });
+messageSchema.index({ batchId: 1, readBy: 1 });
 
 module.exports = mongoose.model('Message', messageSchema);

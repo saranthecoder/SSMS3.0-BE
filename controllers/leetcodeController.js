@@ -53,20 +53,31 @@ const allocateProblem = async (req, res) => {
   }
 };
 
+const { getApprovedBatchIds } = require('../utils/studentBatchCache');
+
+const activeProblemsCache = new Map();
+const ACTIVE_PROBLEMS_TTL_MS = 30000; // 30 seconds
+
 // @desc    Get active problems for student's batches
 // @route   GET /api/leetcode/active
 // @access  Private (Student)
 const getActiveProblems = async (req, res) => {
   try {
-    const Enrollment = require('../models/Enrollment');
-    const enrollments = await Enrollment.find({ studentId: req.user._id, status: 'approved' }).lean();
-    const batchIds = enrollments.map(e => e.batchId);
+    const batchIds = await getApprovedBatchIds(req.user._id);
+    const batchKey = batchIds.map(b => (b._id || b).toString()).sort().join('_') || 'none';
 
-    // Find active problems for the student's batches (including scheduled ones)
-    const activeProblems = await Leetcode.find({
-      batchId: { $in: batchIds },
-      deadline: { $gt: new Date() }
-    }).sort({ createdAt: -1 }).lean();
+    let activeProblems;
+    const now = Date.now();
+    const cached = activeProblemsCache.get(batchKey);
+    if (cached && (now - cached.timestamp) < ACTIVE_PROBLEMS_TTL_MS) {
+      activeProblems = cached.data;
+    } else {
+      activeProblems = await Leetcode.find({
+        batchId: { $in: batchIds },
+        deadline: { $gt: new Date() }
+      }).sort({ createdAt: -1 }).lean();
+      activeProblemsCache.set(batchKey, { data: activeProblems, timestamp: now });
+    }
 
     // Also get user's submissions for these problems to know if they already submitted
     const problemIds = activeProblems.map(p => p._id);
@@ -202,7 +213,7 @@ const getBatchProblems = async (req, res) => {
     let query = { batchId: req.params.batchId };
     const problems = await Leetcode.find(query).sort({ createdAt: -1 }).lean();
     
-    if (req.user.role !== 'admin') {
+    if (req.user.role !== 'admin' && req.user.role !== 'mentor') {
       const processed = problems.map(p => {
         const isLocked = p.scheduledAt && new Date(p.scheduledAt) > new Date();
         return {

@@ -1,5 +1,6 @@
 const Submission = require('../models/Submission');
 const Task = require('../models/Task');
+const { invalidateStudentAnalyticsCache } = require('./analyticsController');
 
 // @desc    Submit a task
 // @route   POST /api/submissions
@@ -18,6 +19,22 @@ const submitTask = async (req, res) => {
       studentId: req.user._id
     });
 
+    const submitTime = new Date();
+    let isLate = false;
+    let delayHours = 0;
+    let latePenalty = 0;
+
+    if (task.dueDate) {
+      const dueMs = new Date(task.dueDate).getTime();
+      const currentMs = submitTime.getTime();
+      if (currentMs > dueMs) {
+        isLate = true;
+        const diffMs = currentMs - dueMs;
+        delayHours = Math.ceil(diffMs / (1000 * 60 * 60));
+        latePenalty = delayHours * 1; // 1 mark per hour delay
+      }
+    }
+
     if (submissionExists) {
       if (submissionExists.status === 'resubmit') {
         // Update existing submission
@@ -30,9 +47,13 @@ const submitTask = async (req, res) => {
         submissionExists.remarks = remarks;
         submissionExists.submittedLinks = submittedLinks || [];
         submissionExists.status = 'submitted'; // Reset status back to submitted
-        submissionExists.submittedAt = Date.now();
+        submissionExists.submittedAt = submitTime;
+        submissionExists.isLate = isLate;
+        submissionExists.delayHours = delayHours;
+        submissionExists.latePenalty = latePenalty;
         
         await submissionExists.save();
+        invalidateStudentAnalyticsCache(req.user._id);
         return res.status(200).json(submissionExists);
       } else {
         return res.status(400).json({ message: 'Task already submitted. Cannot resubmit.' });
@@ -49,8 +70,14 @@ const submitTask = async (req, res) => {
       githubLink,
       liveLink,
       remarks,
+      submittedAt: submitTime,
+      isLate,
+      delayHours,
+      latePenalty,
       submittedLinks: submittedLinks || []
     });
+
+    invalidateStudentAnalyticsCache(req.user._id);
 
     res.status(201).json(submission);
   } catch (error) {
@@ -90,12 +117,23 @@ const getSubmissions = async (req, res) => {
       } else {
         query.taskId = { $in: taskIds };
       }
-    } else if (batchId) {
+    } else if (batchId && batchId !== 'all') {
       const Task = require('../models/Task');
-      const tasksInBatch = await Task.find({ batchId }).select('_id').lean();
+      const Enrollment = require('../models/Enrollment');
+      
+      const [tasksInBatch, batchEnrollments] = await Promise.all([
+        Task.find({ batchId }).select('_id').lean(),
+        Enrollment.find({ batchId, status: { $regex: /^approved$/i } }).select('studentId').lean()
+      ]);
+      
       const taskIds = tasksInBatch.map(t => t._id);
+      const studentIds = batchEnrollments.map(e => e.studentId);
+      
       if (!query.taskId) {
         query.taskId = { $in: taskIds };
+      }
+      if (!query.studentId) {
+        query.studentId = { $in: studentIds };
       }
     }
 

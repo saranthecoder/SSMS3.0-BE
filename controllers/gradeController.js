@@ -1,5 +1,7 @@
 const Grade = require('../models/Grade');
 const Submission = require('../models/Submission');
+const socketHandlers = require('../sockets/socketHandlers');
+const { invalidateStudentAnalyticsCache } = require('./analyticsController');
 
 // @desc    Add grade to a submission
 // @route   POST /api/grades
@@ -18,10 +20,35 @@ const addGrade = async (req, res) => {
       return res.status(400).json({ message: 'Submission already graded. Use update instead.' });
     }
 
+    const rawMarks = Number(marksObtained);
+    let latePenalty = submission.latePenalty || 0;
+    let delayHours = submission.delayHours || 0;
+
+    // Check if submission was late and calculate delay if not already stored
+    if (!latePenalty && submission.taskId?.dueDate && submission.submittedAt) {
+      const dueMs = new Date(submission.taskId.dueDate).getTime();
+      const submitMs = new Date(submission.submittedAt).getTime();
+      if (submitMs > dueMs) {
+        delayHours = Math.ceil((submitMs - dueMs) / (1000 * 60 * 60));
+        latePenalty = delayHours * 1;
+      }
+    }
+
+    // Auto grading penalty: deduct 1 mark per hour delay
+    const finalMarks = latePenalty > 0 ? Math.max(0, rawMarks - latePenalty) : rawMarks;
+
+    let finalFeedback = feedback || '';
+    if (latePenalty > 0 && !finalFeedback.includes('Late Penalty')) {
+      finalFeedback += `\n[Auto-Grading Late Penalty: -${latePenalty} mark(s) for ${delayHours} hr(s) delay. Original: ${rawMarks}, Final: ${finalMarks}]`;
+    }
+
     const grade = await Grade.create({
       submissionId,
-      marksObtained,
-      feedback,
+      marksObtained: finalMarks,
+      rawMarks,
+      latePenalty,
+      delayHours,
+      feedback: finalFeedback,
       reviewedBy: req.user._id
     });
 
@@ -84,6 +111,24 @@ const addGrade = async (req, res) => {
       });
     }
 
+    // Invalidate student analytics cache immediately
+    if (submission.studentId) {
+      invalidateStudentAnalyticsCache(submission.studentId);
+      // Real-time socket notification to the student
+      try {
+        socketHandlers.emitToUser(submission.studentId.toString(), 'task-graded', {
+          gradeId: grade._id,
+          submissionId: submission._id,
+          title: submission.taskId?.title || 'Task',
+          marksObtained: grade.marksObtained,
+          maxMarks: submission.taskId?.maxMarks || 100,
+          reviewedAt: grade.reviewedAt || new Date()
+        });
+      } catch (sockErr) {
+        console.warn('Real-time task-graded socket warning:', sockErr.message);
+      }
+    }
+
     res.status(201).json(grade);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -98,7 +143,12 @@ const updateGrade = async (req, res) => {
     const grade = await Grade.findById(req.params.id);
 
     if (grade) {
-      grade.marksObtained = req.body.marksObtained !== undefined ? req.body.marksObtained : grade.marksObtained;
+      if (req.body.marksObtained !== undefined) {
+        const rawMarks = Number(req.body.marksObtained);
+        const latePenalty = grade.latePenalty || 0;
+        grade.rawMarks = rawMarks;
+        grade.marksObtained = latePenalty > 0 ? Math.max(0, rawMarks - latePenalty) : rawMarks;
+      }
       grade.feedback = req.body.feedback !== undefined ? req.body.feedback : grade.feedback;
       grade.reviewedBy = req.user._id;
       grade.reviewedAt = Date.now();
@@ -107,7 +157,21 @@ const updateGrade = async (req, res) => {
 
       // Ensure the associated submission status is also updated to 'graded'
       const Submission = require('../models/Submission');
-      await Submission.findByIdAndUpdate(grade.submissionId, { status: 'graded' });
+      const sub = await Submission.findByIdAndUpdate(grade.submissionId, { status: 'graded' }).populate('taskId');
+      if (sub?.studentId) {
+        invalidateStudentAnalyticsCache(sub.studentId);
+        try {
+          socketHandlers.emitToUser(sub.studentId.toString(), 'task-graded', {
+            gradeId: updatedGrade._id,
+            submissionId: sub._id,
+            title: sub.taskId?.title || 'Task',
+            marksObtained: updatedGrade.marksObtained,
+            reviewedAt: updatedGrade.reviewedAt
+          });
+        } catch (sockErr) {
+          console.warn('Real-time task-graded socket warning:', sockErr.message);
+        }
+      }
 
       res.json(updatedGrade);
     } else {
