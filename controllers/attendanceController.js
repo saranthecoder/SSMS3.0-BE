@@ -1,5 +1,6 @@
 const Attendance = require('../models/Attendance');
 const CheckInAccess = require('../models/CheckInAccess');
+const DailyWorkload = require('../models/DailyWorkload');
 
 const getISTDateStr = (date = new Date()) => {
   const istTime = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
@@ -12,7 +13,6 @@ const getISTDateStr = (date = new Date()) => {
 const getBatchHourLimits = async (studentId, dateStr = null, forcedAccessType = null) => {
   try {
     const Enrollment = require('../models/Enrollment');
-    const CheckInAccess = require('../models/CheckInAccess');
     const enrollment = await Enrollment.findOne({ studentId, status: 'approved' }).populate('batchId').lean();
     const batch = enrollment && enrollment.batchId ? enrollment.batchId : null;
 
@@ -22,21 +22,21 @@ const getBatchHourLimits = async (studentId, dateStr = null, forcedAccessType = 
       access = await CheckInAccess.findOne({ studentId, dateStr: targetDate }).lean();
     }
 
+    let dailyWl = null;
+    if (batch && batch._id) {
+      dailyWl = await DailyWorkload.findOne({ batchId: batch._id, dateStr: targetDate }).lean();
+    }
+
     const mode = forcedAccessType || (access && access.accessType) || 'on-site';
 
-    // Default admin limits based on work mode
-    let minRequired = 4;
-    let maxAllowed = 10;
+    // Default admin/workload limits based on work mode
+    const defaultOnsiteMin = (dailyWl && dailyWl.onsiteMinHours) || batch?.onsiteMinHours || 2;
+    const defaultOnsiteMax = (dailyWl && dailyWl.onsiteMaxHours) || batch?.onsiteMaxHours || 10;
+    const defaultWfhMin = (dailyWl && dailyWl.wfhMinHours) || batch?.wfhMinHours || 3;
+    const defaultWfhMax = (dailyWl && dailyWl.wfhMaxHours) || batch?.wfhMaxHours || 10;
 
-    if (batch) {
-      if (mode === 'wfh') {
-        minRequired = batch.wfhMinHours !== undefined ? Number(batch.wfhMinHours) : (batch.requiredPresentHours !== undefined ? Number(batch.requiredPresentHours) : 4);
-        maxAllowed = batch.wfhMaxHours !== undefined ? Number(batch.wfhMaxHours) : (batch.maxValidHours !== undefined ? Number(batch.maxValidHours) : 10);
-      } else {
-        minRequired = batch.onsiteMinHours !== undefined ? Number(batch.onsiteMinHours) : (batch.requiredPresentHours !== undefined ? Number(batch.requiredPresentHours) : 4);
-        maxAllowed = batch.onsiteMaxHours !== undefined ? Number(batch.onsiteMaxHours) : (batch.maxValidHours !== undefined ? Number(batch.maxValidHours) : 10);
-      }
-    }
+    let minRequired = (mode === 'wfh') ? defaultWfhMin : defaultOnsiteMin;
+    let maxAllowed = (mode === 'wfh') ? defaultWfhMax : defaultOnsiteMax;
 
     // Mentor day-wise fixed work time overrides default minRequired
     if (access && access.workHours !== undefined && access.workHours !== null) {
@@ -52,10 +52,10 @@ const getBatchHourLimits = async (studentId, dateStr = null, forcedAccessType = 
     return {
       requiredPresentHours: minRequired,
       maxValidHours: maxAllowed,
-      onsiteMinHours: batch?.onsiteMinHours || 4,
-      onsiteMaxHours: batch?.onsiteMaxHours || 10,
-      wfhMinHours: batch?.wfhMinHours || 4,
-      wfhMaxHours: batch?.wfhMaxHours || 10,
+      onsiteMinHours: (access && access.onsiteMinHours) || defaultOnsiteMin,
+      onsiteMaxHours: (access && access.onsiteMaxHours) || defaultOnsiteMax,
+      wfhMinHours: (access && access.wfhMinHours) || defaultWfhMin,
+      wfhMaxHours: (access && access.wfhMaxHours) || defaultWfhMax,
       accessType: mode,
       workHours: access?.workHours || minRequired
     };
@@ -63,14 +63,14 @@ const getBatchHourLimits = async (studentId, dateStr = null, forcedAccessType = 
     console.error('Error fetching batch hour limits:', err);
   }
   return { 
-    requiredPresentHours: 4, 
+    requiredPresentHours: 2, 
     maxValidHours: 10,
-    onsiteMinHours: 4,
+    onsiteMinHours: 2,
     onsiteMaxHours: 10,
-    wfhMinHours: 4,
+    wfhMinHours: 3,
     wfhMaxHours: 10,
     accessType: 'on-site', 
-    workHours: 4 
+    workHours: 2 
   };
 };
 
@@ -106,11 +106,11 @@ const evaluateAttendanceRecord = (record, additionalSeconds = 0) => {
 
   const onsiteMin = (record.onsiteMinHours !== undefined && Number(record.onsiteMinHours) > 0)
     ? Number(record.onsiteMinHours)
-    : 4;
+    : 2;
 
   const wfhMin = (record.wfhMinHours !== undefined && Number(record.wfhMinHours) > 0)
     ? Number(record.wfhMinHours)
-    : 4;
+    : 3;
 
   const onsiteMax = (record.onsiteMaxHours !== undefined && Number(record.onsiteMaxHours) > 0)
     ? Number(record.onsiteMaxHours)
@@ -383,8 +383,20 @@ const checkIn = async (req, res) => {
     });
 
     const isWfh = (access.accessType === 'wfh');
-    const minH = access.minHours || access.workHours || 4;
+    const minH = access.minHours || access.workHours || (isWfh ? 3 : 2);
     const maxH = access.maxHours || 10;
+
+    let dailyWl = null;
+    if (access.batchId) {
+      dailyWl = await DailyWorkload.findOne({ batchId: access.batchId, dateStr }).lean();
+    }
+
+    const resolvedOnsiteMin = access.onsiteMinHours || dailyWl?.onsiteMinHours || (isWfh ? 2 : minH);
+    const resolvedOnsiteMax = access.onsiteMaxHours || dailyWl?.onsiteMaxHours || (isWfh ? 10 : maxH);
+    const resolvedWfhMin = access.wfhMinHours || dailyWl?.wfhMinHours || (isWfh ? minH : 3);
+    const resolvedWfhMax = access.wfhMaxHours || dailyWl?.wfhMaxHours || (isWfh ? maxH : 10);
+    const resolvedOnsiteAlloc = access.onsiteAllocated !== undefined ? access.onsiteAllocated : (dailyWl ? dailyWl.onsiteAllocated : !isWfh);
+    const resolvedWfhAlloc = access.wfhAllocated !== undefined ? access.wfhAllocated : (dailyWl ? dailyWl.wfhAllocated : isWfh);
 
     if (attendance) {
       if (attendance.isActive) {
@@ -401,10 +413,22 @@ const checkIn = async (req, res) => {
         attendance.wfhAllocated = true;
         attendance.wfhMinHours = minH;
         attendance.wfhMaxHours = maxH;
+        if (!attendance.onsiteMinHours || attendance.onsiteMinHours === 4) {
+          attendance.onsiteMinHours = resolvedOnsiteMin;
+        }
+        if (resolvedOnsiteAlloc) {
+          attendance.onsiteAllocated = true;
+        }
       } else {
         attendance.onsiteAllocated = true;
         attendance.onsiteMinHours = minH;
         attendance.onsiteMaxHours = maxH;
+        if (!attendance.wfhMinHours || attendance.wfhMinHours === 4) {
+          attendance.wfhMinHours = resolvedWfhMin;
+        }
+        if (resolvedWfhAlloc) {
+          attendance.wfhAllocated = true;
+        }
       }
       attendance.minRequiredHours = minH;
       attendance.maxValidHours = maxH;
@@ -425,12 +449,12 @@ const checkIn = async (req, res) => {
           maxValidHours: maxH,
           onsiteDurationSeconds: 0,
           wfhDurationSeconds: 0,
-          onsiteAllocated: !isWfh,
-          wfhAllocated: isWfh,
-          onsiteMinHours: !isWfh ? minH : 4,
-          onsiteMaxHours: !isWfh ? maxH : 10,
-          wfhMinHours: isWfh ? minH : 4,
-          wfhMaxHours: isWfh ? maxH : 10,
+          onsiteAllocated: isWfh ? Boolean(resolvedOnsiteAlloc) : true,
+          wfhAllocated: isWfh ? true : Boolean(resolvedWfhAlloc),
+          onsiteMinHours: resolvedOnsiteMin,
+          onsiteMaxHours: resolvedOnsiteMax,
+          wfhMinHours: resolvedWfhMin,
+          wfhMaxHours: resolvedWfhMax,
           isLeave: Boolean(todayApprovedLeave),
           isActive: true
         });
@@ -646,7 +670,7 @@ const getAttendanceSummary = async (req, res) => {
     }
     
     const logs = await Attendance.find(query)
-      .select('studentId dateStr sessionDurationSeconds onsiteDurationSeconds wfhDurationSeconds onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours onsiteAllocated wfhAllocated accessType isActive lastCheckInTime checkInTime checkOutTime isLeave leaveHours status')
+      .select('studentId dateStr sessionDurationSeconds onsiteDurationSeconds wfhDurationSeconds onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours onsiteAllocated wfhAllocated accessType isActive lastCheckInTime checkInTime checkOutTime isLeave leaveHours status workHours minRequiredHours maxValidHours')
       .populate('studentId', 'name email rollNumber')
       .sort({ dateStr: -1, createdAt: -1 })
       .lean();
@@ -682,9 +706,9 @@ const getAttendanceSummary = async (req, res) => {
         totalSeconds: currentDuration,
         onsiteSeconds: currentOnsite,
         wfhSeconds: currentWfh,
-        onsiteMinHours: log.onsiteMinHours || 4,
+        onsiteMinHours: log.onsiteMinHours || 2,
         onsiteMaxHours: log.onsiteMaxHours || 10,
-        wfhMinHours: log.wfhMinHours || 4,
+        wfhMinHours: log.wfhMinHours || 3,
         wfhMaxHours: log.wfhMaxHours || 10,
         onsiteAllocated: Boolean(log.onsiteAllocated || (log.onsiteDurationSeconds > 0)),
         wfhAllocated: Boolean(log.wfhAllocated || (log.wfhDurationSeconds > 0)),
@@ -694,6 +718,8 @@ const getAttendanceSummary = async (req, res) => {
         isActive: log.isActive,
         isLeave: log.isLeave,
         leaveHours: log.leaveHours,
+        requiredPresentHours: log.minRequiredHours || log.workHours || (log.accessType === 'wfh' ? (log.wfhMinHours || 3) : (log.onsiteMinHours || 2)),
+        maxValidHours: log.maxValidHours || 10,
         status: log.status
       };
     });
@@ -767,9 +793,9 @@ const getMyAttendanceSummary = async (req, res) => {
         totalSeconds: currentDuration,
         onsiteSeconds: currentOnsite,
         wfhSeconds: currentWfh,
-        onsiteMinHours: log.onsiteMinHours || 4,
+        onsiteMinHours: log.onsiteMinHours || 2,
         onsiteMaxHours: log.onsiteMaxHours || 10,
-        wfhMinHours: log.wfhMinHours || 4,
+        wfhMinHours: log.wfhMinHours || 3,
         wfhMaxHours: log.wfhMaxHours || 10,
         onsiteAllocated: Boolean(log.onsiteAllocated || (log.onsiteDurationSeconds > 0)),
         wfhAllocated: Boolean(log.wfhAllocated || (log.wfhDurationSeconds > 0)),
@@ -779,6 +805,8 @@ const getMyAttendanceSummary = async (req, res) => {
         isActive: log.isActive,
         isLeave: log.isLeave,
         leaveHours: log.leaveHours,
+        requiredPresentHours: log.minRequiredHours || log.workHours || (log.accessType === 'wfh' ? (log.wfhMinHours || 3) : (log.onsiteMinHours || 2)),
+        maxValidHours: log.maxValidHours || 10,
         status: log.status,
         accessType: log.accessType || 'on-site',
         workHours: log.workHours || dayReqHours,

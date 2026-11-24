@@ -28,6 +28,30 @@ const checkInAccessSchema = new mongoose.Schema({
     type: Number,
     default: 10
   },
+  onsiteAllocated: {
+    type: Boolean,
+    default: false
+  },
+  onsiteMinHours: {
+    type: Number,
+    default: 2
+  },
+  onsiteMaxHours: {
+    type: Number,
+    default: 10
+  },
+  wfhAllocated: {
+    type: Boolean,
+    default: false
+  },
+  wfhMinHours: {
+    type: Number,
+    default: 3
+  },
+  wfhMaxHours: {
+    type: Number,
+    default: 10
+  },
   grantedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',

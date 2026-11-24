@@ -163,12 +163,45 @@ const getMonitorDashboardData = async (req, res) => {
       }
     }
 
+    const isRestrictedScope = !isGlobal && allowedBatchIds.length > 0;
+    const allowedBatchSet = new Set(allowedBatchIds);
+
+    // If restricted scope, pre-fetch task IDs and student IDs belonging to allowed batches
+    let scopedTaskIds = [];
+    let scopedBatchStudentIds = [];
+    if (isRestrictedScope) {
+      const [scopedTasksPre, scopedEnrollmentsPre, scopedUsersPre] = await Promise.all([
+        Task.find({ batchId: { $in: allowedBatchIds } }).select('_id').lean(),
+        Enrollment.find({ batchId: { $in: allowedBatchIds }, status: 'approved' }).select('studentId').lean(),
+        User.find({ batchId: { $in: allowedBatchIds }, role: 'student' }).select('_id').lean()
+      ]);
+      scopedTaskIds = scopedTasksPre.map(t => t._id);
+      const studentIdStrings = [
+        ...scopedEnrollmentsPre.map(e => (e.studentId?._id || e.studentId)?.toString()),
+        ...scopedUsersPre.map(u => u._id.toString())
+      ].filter(Boolean);
+      scopedBatchStudentIds = [...new Set(studentIdStrings)];
+    }
+
+    const taskQuery = isRestrictedScope ? { batchId: { $in: allowedBatchIds } } : {};
+    const submissionQuery = isRestrictedScope
+      ? {
+          $or: [
+            { taskId: { $in: scopedTaskIds } },
+            ...(scopedBatchStudentIds.length > 0 ? [{ studentId: { $in: scopedBatchStudentIds } }] : [])
+          ]
+        }
+      : {};
+    const taskAggMatch = isRestrictedScope ? [{ $match: { taskId: { $in: scopedTaskIds } } }] : [];
+
     // Phase 1: Fetch all data except grades in parallel
     const [
       students,
       activeAttendances,
       allSubmissions,
       allTasks,
+      taskStatsAgg,
+      subStatusAgg,
       attendanceAggregates,
       todayAttendance,
       batches,
@@ -186,19 +219,44 @@ const getMonitorDashboardData = async (req, res) => {
         .populate('studentId', 'name rollNumber profileImage batchId')
         .lean(),
 
-      // All submissions with student + task data (limited to 500 latest)
-      Submission.find()
+      // All submissions with student + task data (scoped to batch or latest 1500 for global)
+      Submission.find(submissionQuery)
         .sort({ submittedAt: -1 })
-        .limit(500)
+        .limit(isRestrictedScope ? 5000 : 1500)
         .populate('studentId', 'name rollNumber profileImage email batchId')
         .populate('taskId', 'title category maxMarks dueDate batchId')
         .lean(),
 
-      // All tasks
-      Task.find()
+      // Tasks (scoped to batch if restricted)
+      Task.find(taskQuery)
         .sort({ createdAt: -1 })
         .populate('batchId', 'batchName')
         .lean(),
+
+      // Exact submission counts and graded counts aggregated per task
+      Submission.aggregate([
+        ...taskAggMatch,
+        {
+          $group: {
+            _id: "$taskId",
+            submissionCount: { $sum: 1 },
+            gradedCount: {
+              $sum: { $cond: [{ $eq: ["$status", "graded"] }, 1, 0] }
+            }
+          }
+        }
+      ]),
+
+      // Exact submission status summary counts
+      Submission.aggregate([
+        ...taskAggMatch,
+        {
+          $group: {
+            _id: "$status",
+            count: { $sum: 1 }
+          }
+        }
+      ]),
 
       // Attendance aggregation per student
       Attendance.aggregate([
@@ -287,9 +345,6 @@ const getMonitorDashboardData = async (req, res) => {
     });
 
     // Filter datasets by allowed batches if scoped to specific batches
-    const isRestrictedScope = !isGlobal && allowedBatchIds.length > 0;
-    const allowedBatchSet = new Set(allowedBatchIds);
-
     const effectiveBatches = isRestrictedScope
       ? batches.filter(b => allowedBatchSet.has(b._id.toString()))
       : batches;
@@ -319,9 +374,29 @@ const getMonitorDashboardData = async (req, res) => {
         })
       : allSubmissions;
 
-    const effectiveTasks = isRestrictedScope
+    // Build task stats map from aggregation
+    const taskStatsMap = {};
+    (taskStatsAgg || []).forEach(stat => {
+      if (stat._id) {
+        taskStatsMap[stat._id.toString()] = {
+          submissionCount: stat.submissionCount || 0,
+          gradedCount: stat.gradedCount || 0
+        };
+      }
+    });
+
+    const effectiveTasks = (isRestrictedScope
       ? allTasks.filter(t => t.batchId && allowedBatchSet.has((t.batchId._id || t.batchId).toString()))
-      : allTasks;
+      : allTasks
+    ).map(task => {
+      const tId = task._id?.toString();
+      const stats = taskStatsMap[tId] || { submissionCount: 0, gradedCount: 0 };
+      return {
+        ...task,
+        submissionCount: stats.submissionCount,
+        gradedCount: stats.gradedCount
+      };
+    });
 
     const effectiveTodayAttendance = isRestrictedScope
       ? todayAttendance.filter(a => {
@@ -498,6 +573,9 @@ const getMonitorDashboardData = async (req, res) => {
       const batchSubmissions = effectiveSubmissions.filter(s =>
         s.taskId && s.taskId.batchId && s.taskId.batchId.toString() === batch._id.toString()
       );
+      const batchSubmissionCount = isRestrictedScope
+        ? batchSubmissions.length
+        : batchTasks.reduce((sum, t) => sum + (t.submissionCount || 0), 0);
       const activeInBatch = batchStudents.filter(s => s.isActive).length;
 
       // Average attendance of batch students
@@ -515,7 +593,7 @@ const getMonitorDashboardData = async (req, res) => {
         studentCount: batchStudents.length,
         activeCount: activeInBatch,
         taskCount: batchTasks.length,
-        submissionCount: batchSubmissions.length,
+        submissionCount: batchSubmissionCount,
         avgAttendanceDays: avgAttendance,
         avgGrade
       };
@@ -572,8 +650,21 @@ const getMonitorDashboardData = async (req, res) => {
     activityTimeline.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
     // Calculate global stats
-    const totalPendingReviews = effectiveSubmissions.filter(s => s.status === 'submitted').length;
-    const totalCompletedReviews = effectiveSubmissions.filter(s => s.status === 'graded').length;
+    let totalSubmissionsCount = 0;
+    let totalPendingReviews = 0;
+    let totalCompletedReviews = 0;
+
+    (subStatusAgg || []).forEach(item => {
+      totalSubmissionsCount += (item.count || 0);
+      if (item._id === 'submitted' || item._id === 'pending') totalPendingReviews += (item.count || 0);
+      if (item._id === 'graded') totalCompletedReviews += (item.count || 0);
+    });
+
+    if (totalSubmissionsCount === 0 && effectiveSubmissions.length > 0) {
+      totalSubmissionsCount = effectiveSubmissions.length;
+      totalPendingReviews = effectiveSubmissions.filter(s => s.status === 'submitted').length;
+      totalCompletedReviews = effectiveSubmissions.filter(s => s.status === 'graded').length;
+    }
     const overallAvgGrade = studentData.length > 0
       ? Math.round(studentData.reduce((sum, s) => sum + s.avgGrade, 0) / studentData.filter(s => s.avgGrade > 0).length) || 0
       : 0;
@@ -614,7 +705,7 @@ const getMonitorDashboardData = async (req, res) => {
         offlineStudents: effectiveStudents.length - effectiveActiveAttendances.length,
         totalBatches: effectiveBatches.length,
         totalTasks: effectiveTasks.length,
-        totalSubmissions: effectiveSubmissions.length,
+        totalSubmissions: totalSubmissionsCount || effectiveSubmissions.length,
         pendingReviews: totalPendingReviews,
         completedReviews: totalCompletedReviews,
         avgAttendanceDays: overallAvgAttendance,

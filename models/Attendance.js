@@ -36,7 +36,7 @@ const attendanceSchema = new mongoose.Schema({
   },
   onsiteMinHours: {
     type: Number,
-    default: 4
+    default: 2
   },
   onsiteMaxHours: {
     type: Number,
@@ -44,7 +44,7 @@ const attendanceSchema = new mongoose.Schema({
   },
   wfhMinHours: {
     type: Number,
-    default: 4
+    default: 3
   },
   wfhMaxHours: {
     type: Number,
