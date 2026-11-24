@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Batch = require('../models/Batch');
 const Enrollment = require('../models/Enrollment');
 const Task = require('../models/Task');
@@ -5,6 +6,7 @@ const Submission = require('../models/Submission');
 const Grade = require('../models/Grade');
 const Attendance = require('../models/Attendance');
 const User = require('../models/User');
+const { ensureBatchCommonGroup } = require('../utils/batchCommonGroup');
 
 // Auto-close expired batches by deadline
 const autoCloseExpiredBatches = async () => {
@@ -63,6 +65,10 @@ const createBatch = async (req, res) => {
     });
 
     const populatedBatch = await Batch.findById(batch._id).populate('mentorId', 'name email phone profileImage equippedAvatar').lean();
+
+    // Automatically create and sync official batch classroom group
+    ensureBatchCommonGroup(batch._id).catch(err => console.warn('Auto batch group create error:', err.message));
+
     res.status(201).json(populatedBatch);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -233,7 +239,6 @@ const getBatchReport = async (req, res) => {
 
     // 5. Get all submissions, mock drive scores and attendance records in parallel
     const MockDriveScore = require('../models/MockDriveScore');
-    const Batch = require('../models/Batch');
     const batch = await Batch.findById(batchId).lean();
 
     const attQuery = { studentId: { $in: studentIds } };
@@ -732,6 +737,9 @@ const bulkUploadStudents = async (req, res) => {
         errors.push(`Row ${row.rowIndex} (${row.rollNumber}): ${err.message}`);
       }
     }
+
+    // Sync batch common group with newly enrolled students
+    ensureBatchCommonGroup(batchId).catch(err => console.warn('Auto batch group sync error:', err.message));
 
     res.json({
       message: 'Bulk student upload completed successfully',

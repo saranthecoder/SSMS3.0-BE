@@ -6,6 +6,7 @@ const Batch = require('../models/Batch');
 const ChatGroup = require('../models/ChatGroup');
 const Friendship = require('../models/Friendship');
 const socketHandlers = require('../sockets/socketHandlers');
+const { ensureBatchCommonGroup } = require('../utils/batchCommonGroup');
 
 // Helper to sanitize message before JSON response
 const formatPopulatedMessage = (msg) => {
@@ -40,16 +41,98 @@ const getChatContacts = async (req, res) => {
   try {
     const userId = req.user._id;
     const role = req.user.role;
+    const { batchId } = req.query;
 
     let contacts = [];
 
-    if (role === 'admin' || role === 'mentor') {
-      // Admins and Mentors can contact all users
+    if (batchId && batchId !== 'all') {
+      // Scoped directly to a specific batch
+      if (!mongoose.Types.ObjectId.isValid(batchId)) {
+        return res.status(400).json({ message: 'Invalid batchId' });
+      }
+
+      // 1. Approved enrolled students in this batch
+      const enrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
+      const studentIds = enrollments.map(e => e.studentId?.toString()).filter(Boolean);
+
+      // 2. Direct students with user.batchId === batchId
+      const batchStudents = await User.find({ batchId, role: 'student' }).select('_id').lean();
+      batchStudents.forEach(u => {
+        const idStr = u._id.toString();
+        if (!studentIds.includes(idStr)) studentIds.push(idStr);
+      });
+
+      // 3. Batch mentors
+      const batchDoc = await Batch.findById(batchId).select('mentorId mentors').lean();
+      const mentorIds = [];
+      if (batchDoc?.mentorId) mentorIds.push(batchDoc.mentorId.toString());
+      if (Array.isArray(batchDoc?.mentors)) {
+        batchDoc.mentors.forEach(m => {
+          if (m) mentorIds.push(m.toString());
+        });
+      }
+
+      // 4. System admins (always reachable for faculty & students)
+      const admins = await User.find({ role: 'admin' }).select('_id').lean();
+      const adminIds = admins.map(a => a._id.toString());
+
+      // If user is a student, also keep accepted friends reachable
+      let acceptedFriendIds = [];
+      if (role === 'student') {
+        const acceptedFriendships = await Friendship.find({
+          status: 'accepted',
+          $or: [{ requester: userId }, { recipient: userId }]
+        }).select('requester recipient').lean();
+        acceptedFriendIds = acceptedFriendships.map(f =>
+          f.requester.toString() === userId.toString() ? f.recipient.toString() : f.requester.toString()
+        );
+      }
+
+      const scopedUserIds = [...new Set([
+        ...studentIds,
+        ...mentorIds,
+        ...adminIds,
+        ...acceptedFriendIds
+      ])].filter(id => id && id !== userId.toString());
+
+      contacts = await User.find({
+        _id: { $in: scopedUserIds }
+      })
+        .select('name email rollNumber role profileImage equippedAvatar lastSeen updatedAt isProfileComplete')
+        .lean();
+    } else if (role === 'admin') {
+      // Admins without batch filter can view all system users
       contacts = await User.find({ _id: { $ne: userId } })
-        .select('name email role profileImage equippedAvatar lastSeen updatedAt isProfileComplete')
+        .select('name email rollNumber role profileImage equippedAvatar lastSeen updatedAt isProfileComplete')
+        .lean();
+    } else if (role === 'mentor') {
+      // Mentors without specific batch filter: scope to students in ALL batches assigned to this mentor + admins
+      const mentorBatches = await Batch.find({
+        $or: [{ mentorId: userId }, { mentors: userId }]
+      }).select('_id').lean();
+      const bIds = mentorBatches.map(b => b._id);
+
+      const enrollments = await Enrollment.find({ batchId: { $in: bIds }, status: 'approved' }).select('studentId').lean();
+      const studentIds = enrollments.map(e => e.studentId?.toString()).filter(Boolean);
+
+      const batchStudents = await User.find({ batchId: { $in: bIds }, role: 'student' }).select('_id').lean();
+      batchStudents.forEach(u => {
+        const idStr = u._id.toString();
+        if (!studentIds.includes(idStr)) studentIds.push(idStr);
+      });
+
+      const admins = await User.find({ role: 'admin' }).select('_id').lean();
+      const adminIds = admins.map(a => a._id.toString());
+
+      const scopedUserIds = [...new Set([...studentIds, ...adminIds])].filter(id => id && id !== userId.toString());
+
+      contacts = await User.find({
+        _id: { $in: scopedUserIds }
+      })
+        .select('name email rollNumber role profileImage equippedAvatar lastSeen updatedAt isProfileComplete')
         .lean();
     } else {
-      // Students: can contact admins, their batch mentors, and ONLY accepted student friends
+      // Students without batch filter: can contact admins, their batch mentors, and ONLY accepted student friends
       const myEnrollments = await Enrollment.find({ studentId: userId, status: 'approved' }).select('batchId');
       const batchIds = myEnrollments.map(e => e.batchId).filter(Boolean);
 
@@ -587,14 +670,61 @@ const getChatGroups = async (req, res) => {
   try {
     const userId = req.user._id;
     const role = req.user.role;
+    const { batchId } = req.query;
 
-    const query = role === 'admin'
-      ? { isArchived: false }
-      : { 'members.user': userId, isArchived: false };
+    // Ensure relevant batch common groups exist and are synced
+    if (batchId && batchId !== 'all' && mongoose.Types.ObjectId.isValid(batchId)) {
+      await ensureBatchCommonGroup(batchId);
+    } else {
+      if (role === 'mentor') {
+        const mentorBatches = await Batch.find({
+          $or: [{ mentorId: userId }, { mentors: userId }]
+        }).select('_id').lean();
+        for (const b of mentorBatches) {
+          await ensureBatchCommonGroup(b._id);
+        }
+      } else if (role === 'student') {
+        const enrollments = await Enrollment.find({ studentId: userId, status: 'approved' }).select('batchId').lean();
+        for (const e of enrollments) {
+          if (e.batchId) await ensureBatchCommonGroup(e.batchId);
+        }
+      } else if (role === 'admin') {
+        const activeBatches = await Batch.find({ status: 'Active' }).select('_id').lean();
+        for (const b of activeBatches) {
+          await ensureBatchCommonGroup(b._id);
+        }
+      }
+    }
+
+    let query = {};
+    if (batchId && batchId !== 'all' && mongoose.Types.ObjectId.isValid(batchId)) {
+      if (role === 'admin') {
+        query = {
+          $or: [
+            { batchId },
+            { batchId: null }
+          ],
+          isArchived: false
+        };
+      } else {
+        query = {
+          $or: [
+            { batchId, 'members.user': userId },
+            { batchId: null, 'members.user': userId }
+          ],
+          isArchived: false
+        };
+      }
+    } else {
+      query = role === 'admin'
+        ? { isArchived: false }
+        : { 'members.user': userId, isArchived: false };
+    }
 
     const groups = await ChatGroup.find(query)
       .populate('creatorId', 'name email role')
-      .sort({ updatedAt: -1 })
+      .populate('batchId', 'batchName panelName status')
+      .sort({ isBatchCommon: -1, updatedAt: -1 })
       .lean();
 
     const groupIds = groups.map(g => g._id);
@@ -643,10 +773,20 @@ const getChatGroups = async (req, res) => {
       const gIdStr = grp._id.toString();
       return {
         ...grp,
+        isBatchCommon: Boolean(grp.isBatchCommon),
         memberCount: grp.members?.length || 0,
         lastMessage: lastMsgMap.get(gIdStr) || null,
         unreadCount: unreadMap.get(gIdStr) || 0
       };
+    });
+
+    // Ensure common batch groups are pinned at the top
+    groupsWithMeta.sort((a, b) => {
+      if (a.isBatchCommon && !b.isBatchCommon) return -1;
+      if (!a.isBatchCommon && b.isBatchCommon) return 1;
+      const timeA = a.lastMessage?.createdAt ? new Date(a.lastMessage.createdAt).getTime() : new Date(a.updatedAt).getTime();
+      const timeB = b.lastMessage?.createdAt ? new Date(b.lastMessage.createdAt).getTime() : new Date(b.updatedAt).getTime();
+      return timeB - timeA;
     });
 
     res.json(groupsWithMeta);
@@ -851,6 +991,10 @@ const leaveChatGroup = async (req, res) => {
 
     const group = await ChatGroup.findById(groupId);
     if (!group) return res.status(404).json({ message: 'Group not found' });
+
+    if (group.isBatchCommon) {
+      return res.status(400).json({ message: 'Cannot leave an official batch classroom group' });
+    }
 
     group.members = group.members.filter(m => m.user.toString() !== userId.toString());
 

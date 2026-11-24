@@ -1,5 +1,6 @@
 const Enrollment = require('../models/Enrollment');
 const Batch = require('../models/Batch');
+const { ensureBatchCommonGroup } = require('../utils/batchCommonGroup');
 
 // @desc    Request batch enrollment
 // @route   POST /api/enrollments/request
@@ -64,6 +65,12 @@ const approveEnrollment = async (req, res) => {
     if (enrollment) {
       enrollment.status = 'approved';
       const updatedEnrollment = await enrollment.save();
+
+      // Automatically add newly approved student into the official batch classroom group
+      if (enrollment.batchId) {
+        ensureBatchCommonGroup(enrollment.batchId).catch(err => console.warn('Enrollment group sync error:', err.message));
+      }
+
       res.json(updatedEnrollment);
     } else {
       res.status(404).json({ message: 'Enrollment request not found' });

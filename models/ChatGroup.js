@@ -45,6 +45,10 @@ const chatGroupSchema = new mongoose.Schema({
   isArchived: {
     type: Boolean,
     default: false
+  },
+  isBatchCommon: {
+    type: Boolean,
+    default: false
   }
 }, {
   timestamps: true
@@ -53,5 +57,6 @@ const chatGroupSchema = new mongoose.Schema({
 chatGroupSchema.index({ 'members.user': 1 });
 chatGroupSchema.index({ creatorId: 1 });
 chatGroupSchema.index({ batchId: 1 });
+chatGroupSchema.index({ batchId: 1, isBatchCommon: 1 });
 
 module.exports = mongoose.model('ChatGroup', chatGroupSchema);
