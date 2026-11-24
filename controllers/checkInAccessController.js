@@ -123,6 +123,25 @@ const grantAccess = async (req, res) => {
       console.warn('Syncing attendance records on grantAccess warning:', syncErr.message);
     }
 
+    // Emit real-time socket event so student dashboards update immediately without manual reload
+    try {
+      const { emitToUser, emitToBatch } = require('../sockets/socketHandlers');
+      const payload = {
+        hasAccess: true,
+        accessType: type,
+        workHours: effWorkHours,
+        minHours: effMinHours,
+        maxHours: effMaxHours,
+        batchId
+      };
+      emitToBatch(batchId, 'checkin-access-updated', payload);
+      targetStudentIds.forEach(id => {
+        emitToUser(id, 'checkin-access-updated', payload);
+      });
+    } catch (socketErr) {
+      console.warn('Socket emit error in grantAccess:', socketErr.message);
+    }
+
     const skippedCount = studentIds.length - targetStudentIds.length;
     let message = 'Access granted successfully.';
     if (skippedCount > 0) {
@@ -154,6 +173,19 @@ const revokeAccess = async (req, res) => {
       await CheckInAccess.findOneAndDelete({ studentId, batchId, dateStr });
     } else {
       return res.status(400).json({ message: 'studentId or studentIds is required.' });
+    }
+
+    // Emit real-time socket event so student dashboards update immediately without manual reload
+    try {
+      const { emitToUser, emitToBatch } = require('../sockets/socketHandlers');
+      const payload = { hasAccess: false, batchId };
+      emitToBatch(batchId, 'checkin-access-updated', payload);
+      if (studentId) emitToUser(studentId, 'checkin-access-updated', payload);
+      if (studentIds && Array.isArray(studentIds)) {
+        studentIds.forEach(id => emitToUser(id, 'checkin-access-updated', payload));
+      }
+    } catch (socketErr) {
+      console.warn('Socket emit error in revokeAccess:', socketErr.message);
     }
 
     res.status(200).json({ message: 'Access revoked successfully.' });
