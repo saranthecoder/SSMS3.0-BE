@@ -305,10 +305,10 @@ module.exports = (io) => {
     });
 
     // ----- SEND CHAT MESSAGE (Group, Batch or 1-on-1 with Message Integrity) -----
-    socket.on('send-chat-message', async (data) => {
+    socket.on('send-chat-message', async (data, callback) => {
       const {
         batchId, groupId, recipientId, text,
-        isAnnouncement, announcementTitle, attachmentUrl, attachmentName, attachmentType
+        isAnnouncement, announcementTitle, attachmentUrl, attachmentName, attachmentType, tempId
       } = data || {};
 
       try {
@@ -333,9 +333,11 @@ module.exports = (io) => {
               ]
             });
             if (!areFriends) {
-              return socket.emit('chat-error', {
-                message: 'Students can only privately message accepted friends. Please send a friend request first.'
-              });
+              const errMsg = 'Students can only privately message accepted friends. Please send a friend request first.';
+              if (typeof callback === 'function') {
+                callback({ success: false, message: errMsg, tempId });
+              }
+              return socket.emit('chat-error', { message: errMsg });
             }
           }
         }
@@ -361,6 +363,7 @@ module.exports = (io) => {
 
         const formattedMsg = {
           _id: newMessage._id,
+          tempId: tempId || null,
           batchId: newMessage.batchId,
           groupId: newMessage.groupId,
           recipientId: newMessage.recipientId,
@@ -381,6 +384,11 @@ module.exports = (io) => {
             profileImage: senderAvatar
           }
         };
+
+        // Acknowledge immediately to sender
+        if (typeof callback === 'function') {
+          callback({ success: true, message: formattedMsg, tempId });
+        }
 
         if (batchId) {
           const room = `batch_${batchId}`;
@@ -472,6 +480,9 @@ module.exports = (io) => {
         }
       } catch (err) {
         console.error('Error processing send-chat-message:', err.message);
+        if (typeof callback === 'function') {
+          callback({ success: false, message: 'Failed to send message', tempId });
+        }
         socket.emit('chat-error', { message: 'Failed to send message' });
       }
     });

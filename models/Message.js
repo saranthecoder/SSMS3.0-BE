@@ -57,11 +57,17 @@ const messageSchema = new mongoose.Schema({
   timestamps: true
 });
 
+messageSchema.index({ batchId: 1, createdAt: -1 });
 messageSchema.index({ batchId: 1, createdAt: 1 });
+messageSchema.index({ groupId: 1, createdAt: -1 });
 messageSchema.index({ groupId: 1, createdAt: 1 });
+messageSchema.index({ senderId: 1, recipientId: 1, createdAt: -1 });
 messageSchema.index({ senderId: 1, recipientId: 1, createdAt: 1 });
+messageSchema.index({ recipientId: 1, senderId: 1, createdAt: -1 });
 messageSchema.index({ recipientId: 1, senderId: 1, createdAt: 1 });
+messageSchema.index({ recipientId: 1, senderId: 1, readBy: 1 });
 messageSchema.index({ recipientId: 1, readBy: 1 });
+messageSchema.index({ recipientId: 1, createdAt: -1 });
 messageSchema.index({ groupId: 1, readBy: 1 });
 messageSchema.index({ batchId: 1, readBy: 1 });
 

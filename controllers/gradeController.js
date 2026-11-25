@@ -56,7 +56,7 @@ const addGrade = async (req, res) => {
     submission.status = 'graded';
     await submission.save();
 
-    // Gamification rewards for student
+    // Gamification rewards for student (respecting 10x marks coins rule and avoiding duplicate awards)
     const User = require('../models/User');
     const studentUser = await User.findById(submission.studentId);
     if (studentUser) {
@@ -65,19 +65,19 @@ const addGrade = async (req, res) => {
       
       const isProject = submission.taskId?.category === 'Project';
       let baseXP = 150;
-      let baseCoins = 60;
+      let baseCoins = maxMarks * 10;
 
       if (isProject) {
         const titleLower = (submission.taskId?.title || '').toLowerCase();
         if (titleLower.includes('final') || titleLower.includes('capstone')) {
           baseXP = 5000;
-          baseCoins = 2500;
+          baseCoins = Math.max(2500, maxMarks * 10);
         } else if (titleLower.includes('large') || maxMarks >= 100) {
           baseXP = 1500;
-          baseCoins = 700;
+          baseCoins = Math.max(700, maxMarks * 10);
         } else {
           baseXP = 500;
-          baseCoins = 250;
+          baseCoins = Math.max(250, maxMarks * 10);
         }
       }
 
@@ -90,25 +90,37 @@ const addGrade = async (req, res) => {
         multiplier = 0.50;
       }
 
-      const coinsReward = Math.round(baseCoins * multiplier);
+      const targetCoins = isProject
+        ? Math.round(baseCoins * multiplier)
+        : Math.round(marksObtained * 10);
+      const alreadyAwarded = submission.coinsAwarded || 0;
+      const coinsReward = Math.max(0, targetCoins - alreadyAwarded);
       const pointsReward = Math.round(baseXP * multiplier);
       
       const { awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges } = require('../utils/gamification');
-      const actualCoins = awardCoinsWithCap(studentUser, coinsReward, `Grade: ${percentage.toFixed(0)}%`, isProject);
+      const actualCoins = coinsReward > 0
+        ? awardCoinsWithCap(studentUser, coinsReward, `Grade: ${percentage.toFixed(0)}%`, true)
+        : 0;
       const actualXP = awardXPWithCap(studentUser, pointsReward, `Grade: ${percentage.toFixed(0)}%`, isProject);
       checkAndAwardBadges(studentUser);
       
       await studentUser.save();
 
-      // Create GamificationEvent record for user reward history
-      const GamificationEvent = require('../models/GamificationEvent');
-      await GamificationEvent.create({
-        userId: studentUser._id,
-        eventType: 'coins_earned',
-        coinsChange: actualCoins,
-        xpChange: actualXP.actual || 0,
-        reason: `Grade: ${percentage.toFixed(0)}% for "${submission.taskId?.title || 'Task'}"`
-      });
+      if (actualCoins > 0) {
+        submission.coinsAwarded = alreadyAwarded + actualCoins;
+        await submission.save();
+      }
+
+      if (actualCoins > 0 || (actualXP.actual || 0) > 0) {
+        const GamificationEvent = require('../models/GamificationEvent');
+        await GamificationEvent.create({
+          userId: studentUser._id,
+          eventType: 'coins_earned',
+          coinsChange: actualCoins,
+          xpChange: actualXP.actual || 0,
+          reason: `Grade: ${percentage.toFixed(0)}% for "${submission.taskId?.title || 'Task'}"`
+        });
+      }
     }
 
     // Invalidate student analytics cache immediately
@@ -300,19 +312,19 @@ const autoEvaluateSubmissions = async (req, res) => {
             
             const isProject = task.category === 'Project';
             let baseXP = 150;
-            let baseCoins = 60;
+            let baseCoins = maxMarks * 10;
 
             if (isProject) {
               const titleLower = (task.title || '').toLowerCase();
               if (titleLower.includes('final') || titleLower.includes('capstone')) {
                 baseXP = 5000;
-                baseCoins = 2500;
+                baseCoins = Math.max(2500, maxMarks * 10);
               } else if (titleLower.includes('large') || maxMarks >= 100) {
                 baseXP = 1500;
-                baseCoins = 700;
+                baseCoins = Math.max(700, maxMarks * 10);
               } else {
                 baseXP = 500;
-                baseCoins = 250;
+                baseCoins = Math.max(250, maxMarks * 10);
               }
             }
 
@@ -325,24 +337,37 @@ const autoEvaluateSubmissions = async (req, res) => {
               multiplier = 0.50;
             }
 
-            const coinsReward = Math.round(baseCoins * multiplier);
+            const targetCoins = isProject
+              ? Math.round(baseCoins * multiplier)
+              : Math.round(marksObtained * 10);
+            const alreadyAwarded = submission.coinsAwarded || 0;
+            const coinsReward = Math.max(0, targetCoins - alreadyAwarded);
             const pointsReward = Math.round(baseXP * multiplier);
             
             const { awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges } = require('../utils/gamification');
-            const actualCoins = awardCoinsWithCap(studentUser, coinsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, isProject);
+            const actualCoins = coinsReward > 0
+              ? awardCoinsWithCap(studentUser, coinsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, true)
+              : 0;
             const actualXP = awardXPWithCap(studentUser, pointsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, isProject);
             checkAndAwardBadges(studentUser);
             
             await studentUser.save();
 
-            const GamificationEvent = require('../models/GamificationEvent');
-            await GamificationEvent.create({
-              userId: studentUser._id,
-              eventType: 'coins_earned',
-              coinsChange: actualCoins,
-              xpChange: actualXP.actual || 0,
-              reason: `Auto-Grade: ${percentage.toFixed(0)}% for "${task.title || 'Task'}"`
-            });
+            if (actualCoins > 0) {
+              submission.coinsAwarded = alreadyAwarded + actualCoins;
+              await submission.save();
+            }
+
+            if (actualCoins > 0 || (actualXP.actual || 0) > 0) {
+              const GamificationEvent = require('../models/GamificationEvent');
+              await GamificationEvent.create({
+                userId: studentUser._id,
+                eventType: 'coins_earned',
+                coinsChange: actualCoins,
+                xpChange: actualXP.actual || 0,
+                reason: `Auto-Grade: ${percentage.toFixed(0)}% for "${task.title || 'Task'}"`
+              });
+            }
           }
         } catch (rewErr) {
           console.error('Error awarding auto-eval coins:', rewErr);

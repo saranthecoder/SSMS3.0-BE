@@ -203,8 +203,13 @@ const getStudentAnalytics = async (req, res) => {
         }),
         Submission.find({ studentId }).select('_id taskId status createdAt updatedAt').lean(),
         Message.countDocuments({
-          batchId: { $in: batchIds },
+          createdAt: { $gte: new Date(Date.now() - 7 * 24 * 3600 * 1000) },
+          readBy: { $ne: studentId },
           senderId: { $ne: studentId },
+          $or: [
+            { recipientId: studentId },
+            { batchId: { $in: batchIds }, recipientId: null }
+          ]
         }),
         Task.find({
           batchId: { $in: batchIds },
@@ -368,8 +373,13 @@ const getStudentAnalytics = async (req, res) => {
       }),
       Submission.find({ studentId }).select('_id taskId status createdAt updatedAt').populate('taskId', 'title maxMarks').lean(),
       Message.find({
-        batchId: { $in: batchIds },
+        createdAt: { $gte: new Date(Date.now() - 7 * 24 * 3600 * 1000) },
+        readBy: { $ne: studentId },
         senderId: { $ne: studentId },
+        $or: [
+          { recipientId: studentId },
+          { batchId: { $in: batchIds }, recipientId: null }
+        ]
       }).sort({ createdAt: -1 }).limit(3).populate('senderId', 'name').select('senderId text createdAt').lean(),
       Batch.countDocuments({ status: { $in: ['Active', 'Upcoming'] } }),
       Batch.find({ _id: { $in: batchIds } }).limit(3).select('batchName status').lean(),
@@ -859,14 +869,50 @@ const getAdminDashboardStats = async (req, res) => {
     notifications.sort((a, b) => new Date(b.time) - new Date(a.time));
     notifications = notifications.slice(0, 10);
 
-    // Unread recent messages count for admin/mentor badge
+    // Unread recent messages count for admin/mentor badge:
+    // Only count messages specifically directed to or visible to this user
     let recentChats = 0;
     try {
       const Message = require('../models/Message');
+      const Batch = require('../models/Batch');
+      const ChatGroup = require('../models/ChatGroup');
+
+      const userId = req.user._id;
+      const isAdmin = req.user.role === 'admin';
+
+      let batchIds = [];
+      let groupIds = [];
+
+      if (isAdmin) {
+        const allBatches = await Batch.find({ status: { $in: ['Active', 'Upcoming'] } }).select('_id').lean();
+        batchIds = allBatches.map(b => b._id);
+        const allGroups = await ChatGroup.find({ isArchived: { $ne: true } }).select('_id').lean();
+        groupIds = allGroups.map(g => g._id);
+      } else {
+        const mentorBatches = await Batch.find({
+          $or: [{ mentorId: userId }, { assignedMentors: userId }, { creatorId: userId }]
+        }).select('_id').lean();
+        batchIds = mentorBatches.map(b => b._id);
+
+        const memberGroups = await ChatGroup.find({
+          $or: [
+            { 'members.user': userId },
+            { isBatchCommon: true, batchId: { $in: batchIds } }
+          ],
+          isArchived: { $ne: true }
+        }).select('_id').lean();
+        groupIds = memberGroups.map(g => g._id);
+      }
+
+      const userChatOrConditions = [{ recipientId: userId }];
+      if (groupIds.length > 0) userChatOrConditions.push({ groupId: { $in: groupIds } });
+      if (batchIds.length > 0) userChatOrConditions.push({ batchId: { $in: batchIds }, recipientId: null });
+
       recentChats = await Message.countDocuments({
         createdAt: { $gte: new Date(Date.now() - 7 * 24 * 3600 * 1000) },
-        readBy: { $ne: req.user._id },
-        senderId: { $ne: req.user._id }
+        readBy: { $ne: userId },
+        senderId: { $ne: userId },
+        $or: userChatOrConditions
       });
     } catch (msgErr) {
       console.warn('Error counting recent chats for dashboard:', msgErr.message);

@@ -122,6 +122,7 @@ const noteRoutes = require('./routes/noteRoutes');
 const mentorRoutes = require('./routes/mentorRoutes');
 const monitorAccessRoutes = require('./routes/monitorAccessRoutes');
 const syllabusRoutes = require('./routes/syllabusRoutes');
+const reportRoutes = require('./routes/reportRoutes');
 const path = require('path');
 
 app.use('/api/auth', authRoutes);
@@ -146,6 +147,7 @@ app.use('/api/notes', noteRoutes);
 app.use('/api/mentors', mentorRoutes);
 app.use('/api/monitor-access', monitorAccessRoutes);
 app.use('/api/syllabus', syllabusRoutes);
+app.use('/api/reports', reportRoutes);
 
 // Custom Domain Proxy Route: Serves Cloudinary / MongoDB / Disk files under your domain name
 const Upload = require('./models/Upload');
@@ -334,6 +336,45 @@ cron.schedule('0 * * * *', async () => {
       await problem.save();
     }
   });
+});
+
+// Auto-Schedule WFH Access & On-Site Auto-Checkout Check - runs every minute
+cron.schedule('* * * * *', async () => {
+  try {
+    const DailyWorkload = require('./models/DailyWorkload');
+    const {
+      triggerAutoWfhGrant,
+      triggerAutoOnsiteCheckoutAndRevoke,
+      getISTTimeStr,
+      getISTDateStr
+    } = require('./controllers/checkInAccessController');
+    const dateStr = getISTDateStr();
+    const currentISTTime = getISTTimeStr();
+
+    const pendingWorkloads = await DailyWorkload.find({
+      dateStr,
+      autoWfhEnabled: true,
+      autoWfhGranted: { $ne: true },
+      autoWfhTime: { $lte: currentISTTime }
+    });
+
+    for (const dw of pendingWorkloads) {
+      await triggerAutoWfhGrant(dw.batchId, dateStr);
+    }
+
+    const pendingOnsiteCheckouts = await DailyWorkload.find({
+      dateStr,
+      autoOnsiteCheckoutEnabled: true,
+      autoOnsiteCheckoutDone: { $ne: true },
+      autoOnsiteCheckoutTime: { $lte: currentISTTime }
+    });
+
+    for (const dw of pendingOnsiteCheckouts) {
+      await triggerAutoOnsiteCheckoutAndRevoke(dw.batchId, dateStr);
+    }
+  } catch (err) {
+    // silently handle background job errors
+  }
 });
 
 // Self-ping to keep server awake on Render free tier

@@ -4,6 +4,10 @@ const Batch = require('../models/Batch');
 const Enrollment = require('../models/Enrollment');
 const User = require('../models/User');
 
+// In-memory cache for batch sync cooldown to avoid re-aggregating on every single HTTP GET
+const batchSyncCooldown = new Map();
+const COOLDOWN_MS = 60000; // 60 seconds
+
 /**
  * Ensures an official Common Chat Group exists for a given batch,
  * and synchronizes all enrolled students, assigned mentors, and admins as members.
@@ -13,6 +17,14 @@ const User = require('../models/User');
  */
 const ensureBatchCommonGroup = async (batchId) => {
   if (!batchId || !mongoose.Types.ObjectId.isValid(batchId)) return null;
+  const bIdStr = batchId.toString();
+
+  // Fast path: if recently synced and group exists, return immediately
+  const lastSync = batchSyncCooldown.get(bIdStr);
+  if (lastSync && (Date.now() - lastSync < COOLDOWN_MS)) {
+    const existingGroup = await ChatGroup.findOne({ batchId, isBatchCommon: true }).lean();
+    if (existingGroup) return existingGroup;
+  }
 
   try {
     const batch = await Batch.findById(batchId).lean();
@@ -122,6 +134,7 @@ const ensureBatchCommonGroup = async (batchId) => {
       }
     }
 
+    batchSyncCooldown.set(bIdStr, Date.now());
     return group;
   } catch (error) {
     console.error(`ensureBatchCommonGroup error for batch ${batchId}:`, error.message);

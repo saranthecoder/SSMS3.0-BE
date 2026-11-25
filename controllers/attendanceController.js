@@ -1054,13 +1054,14 @@ const getPublicAttendanceSummary = async (req, res) => {
     }
     
     const Leave = require('../models/Leave');
+    const DailyWorkload = require('../models/DailyWorkload');
 
-    const [logs, accessGrants, leaves] = await Promise.all([
+    const [logs, accessGrants, leaves, dailyWorkload] = await Promise.all([
       Attendance.find(query)
-        .select('studentId dateStr sessionDurationSeconds onsiteDurationSeconds wfhDurationSeconds onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours accessType isActive lastCheckInTime checkInTime checkOutTime isLeave leaveHours status')
+        .select('studentId dateStr sessionDurationSeconds onsiteDurationSeconds wfhDurationSeconds onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours onsiteAllocated wfhAllocated accessType isActive lastCheckInTime checkInTime checkOutTime isLeave leaveHours status workHours minRequiredHours maxValidHours')
         .lean(),
       CheckInAccess.find(batchId ? { batchId, dateStr: targetDateStr } : { dateStr: targetDateStr })
-        .select('studentId dateStr accessType workHours minHours maxHours')
+        .select('studentId dateStr accessType workHours minHours maxHours onsiteAllocated wfhAllocated onsiteMinHours onsiteMaxHours wfhMinHours wfhMaxHours')
         .lean(),
       Leave.find({
         status: 'approved',
@@ -1072,7 +1073,8 @@ const getPublicAttendanceSummary = async (req, res) => {
             endDate: { $gte: targetDateStr }
           }
         ]
-      }).lean()
+      }).lean(),
+      batchId ? DailyWorkload.findOne({ batchId, dateStr: targetDateStr }).lean() : Promise.resolve(null)
     ]);
     
     const logsMap = {};
@@ -1118,6 +1120,33 @@ const getPublicAttendanceSummary = async (req, res) => {
           currentOnsite += delta;
         }
       }
+
+      const onsiteMinHours = log?.onsiteMinHours || grant?.onsiteMinHours || dailyWorkload?.onsiteMinHours || 4;
+      const onsiteMaxHours = log?.onsiteMaxHours || grant?.onsiteMaxHours || dailyWorkload?.onsiteMaxHours || 10;
+      const wfhMinHours = log?.wfhMinHours || grant?.wfhMinHours || dailyWorkload?.wfhMinHours || 4;
+      const wfhMaxHours = log?.wfhMaxHours || grant?.wfhMaxHours || dailyWorkload?.wfhMaxHours || 10;
+
+      const onsiteAllocated = Boolean(log?.onsiteAllocated || grant?.onsiteAllocated || dailyWorkload?.onsiteAllocated || currentOnsite > 0 || accessType === 'on-site');
+      const wfhAllocated = Boolean(log?.wfhAllocated || grant?.wfhAllocated || dailyWorkload?.wfhAllocated || currentWfh > 0 || accessType === 'wfh');
+
+      const onsiteMet = !onsiteAllocated || currentOnsite >= (onsiteMinHours * 3600);
+      const wfhMet = !wfhAllocated || currentWfh >= (wfhMinHours * 3600);
+      const bothMet = onsiteMet && wfhMet;
+
+      // Evaluate accurate day status (Present, In Progress, Invalid, Leave, Absent)
+      let computedStatus = 'Absent';
+      const totalHours = currentDuration / 3600;
+      if (log?.status === 'Leave' || (studentLeave && studentLeave.leaveType !== 'hours' && !log?.isActive && !bothMet)) {
+        computedStatus = 'Leave';
+      } else if (log?.status === 'Invalid' || totalHours > maxHours) {
+        computedStatus = 'Invalid';
+      } else if (bothMet && (currentOnsite > 0 || currentWfh > 0 || (log?.leaveHours || 0) > 0)) {
+        computedStatus = 'Present';
+      } else if (log?.isActive) {
+        computedStatus = 'In Progress';
+      } else if (log?.status === 'Present' && bothMet) {
+        computedStatus = 'Present';
+      }
       
       return {
         _id: log ? log._id : `absent_${sId}`,
@@ -1129,14 +1158,19 @@ const getPublicAttendanceSummary = async (req, res) => {
         totalSeconds: currentDuration,
         onsiteSeconds: currentOnsite,
         wfhSeconds: currentWfh,
-        onsiteMinHours: log?.onsiteMinHours || grant?.minHours || 4,
-        onsiteMaxHours: log?.onsiteMaxHours || grant?.maxHours || 10,
-        wfhMinHours: log?.wfhMinHours || grant?.minHours || 4,
-        wfhMaxHours: log?.wfhMaxHours || grant?.maxHours || 10,
+        onsiteMinHours,
+        onsiteMaxHours,
+        wfhMinHours,
+        wfhMaxHours,
+        onsiteAllocated,
+        wfhAllocated,
+        onsiteMet,
+        wfhMet,
+        bothMet,
         firstCheckIn: log ? log.checkInTime : null,
         lastCheckOut: log ? log.checkOutTime : null,
         isActive: log ? log.isActive : false,
-        isLeave: log ? log.isLeave : false,
+        isLeave: Boolean(log?.isLeave || (studentLeave && studentLeave.leaveType !== 'hours')),
         leaveHours: log ? log.leaveHours : 0,
         leaveInfo: studentLeave ? (
           studentLeave.leaveType === 'hours'
@@ -1146,7 +1180,7 @@ const getPublicAttendanceSummary = async (req, res) => {
               : 'Day Leave'
         ) : null,
         leaveType: studentLeave ? studentLeave.leaveType : null,
-        status: log ? log.status : 'Absent',
+        status: computedStatus,
         accessType,
         workHours,
         minHours,

@@ -42,6 +42,15 @@ const getChatContacts = async (req, res) => {
     const userId = req.user._id;
     const role = req.user.role;
     const { batchId } = req.query;
+    const search = (req.query.search || '').trim();
+
+    const searchCondition = search ? {
+      $or: [
+        { name: { $regex: search.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), $options: 'i' } },
+        { email: { $regex: search.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), $options: 'i' } },
+        { rollNumber: { $regex: search.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), $options: 'i' } }
+      ]
+    } : {};
 
     let contacts = [];
 
@@ -95,14 +104,17 @@ const getChatContacts = async (req, res) => {
         ...acceptedFriendIds
       ])].filter(id => id && id !== userId.toString());
 
-      contacts = await User.find({
-        _id: { $in: scopedUserIds }
-      })
+      const userQuery = {
+        _id: { $in: scopedUserIds },
+        ...searchCondition
+      };
+
+      contacts = await User.find(userQuery)
         .select('name email rollNumber role profileImage equippedAvatar lastSeen updatedAt isProfileComplete')
         .lean();
     } else if (role === 'admin') {
       // Admins without batch filter can view all system users
-      contacts = await User.find({ _id: { $ne: userId } })
+      contacts = await User.find({ _id: { $ne: userId }, ...searchCondition })
         .select('name email rollNumber role profileImage equippedAvatar lastSeen updatedAt isProfileComplete')
         .lean();
     } else if (role === 'mentor') {
@@ -127,7 +139,8 @@ const getChatContacts = async (req, res) => {
       const scopedUserIds = [...new Set([...studentIds, ...adminIds])].filter(id => id && id !== userId.toString());
 
       contacts = await User.find({
-        _id: { $in: scopedUserIds }
+        _id: { $in: scopedUserIds },
+        ...searchCondition
       })
         .select('name email rollNumber role profileImage equippedAvatar lastSeen updatedAt isProfileComplete')
         .lean();
@@ -163,7 +176,8 @@ const getChatContacts = async (req, res) => {
           { _id: { $in: mentorIds } },
           { _id: { $in: acceptedFriendIds } }
         ],
-        _id: { $ne: userId }
+        _id: { $ne: userId },
+        ...searchCondition
       })
         .select('name email rollNumber role profileImage equippedAvatar lastSeen updatedAt isProfileComplete')
         .lean();
@@ -303,7 +317,7 @@ const getDirectMessages = async (req, res) => {
     const messages = await Message.find(query)
       .populate('senderId', 'name email phone role profileImage equippedAvatar')
       .populate('recipientId', 'name email phone role profileImage equippedAvatar')
-      .sort({ createdAt: 1 })
+      .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
 
@@ -327,7 +341,7 @@ const getDirectMessages = async (req, res) => {
       { $addToSet: { deliveredTo: currentUserId } }
     ).catch(err => console.warn('Background delivered mark error:', err.message));
 
-    res.json(messages);
+    res.json(messages.reverse());
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -378,7 +392,7 @@ const getBatchMessages = async (req, res) => {
 
     const messages = await Message.find(query)
       .populate('senderId', 'name email phone role profileImage equippedAvatar')
-      .sort({ createdAt: 1 })
+      .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
 
@@ -388,7 +402,7 @@ const getBatchMessages = async (req, res) => {
       { $addToSet: { readBy: userId } }
     ).catch(err => console.warn('Background batch read error:', err.message));
 
-    res.json(messages);
+    res.json(messages.reverse());
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -840,32 +854,36 @@ const getGroupMessages = async (req, res) => {
       return res.status(400).json({ message: 'Invalid group ID' });
     }
 
-    const group = await ChatGroup.findById(groupId).select('members').lean();
+    const group = await ChatGroup.findById(groupId).select('members isBatchCommon batchId').lean();
     if (!group) return res.status(404).json({ message: 'Group not found' });
 
-    const isMember = group.members.some(m => m.user.toString() === userId.toString());
+    const isMember = group.members?.some(m => m.user?.toString() === userId.toString());
     if (!isMember && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Access denied: You are not a member of this group' });
     }
 
-    const query = { groupId };
+    const groupCondition = (group.isBatchCommon && group.batchId)
+      ? { $or: [{ groupId }, { batchId: group.batchId, groupId: null }] }
+      : { groupId };
+
+    const query = { ...groupCondition };
     if (before) {
       query.createdAt = { $lt: new Date(before) };
     }
 
     const messages = await Message.find(query)
       .populate('senderId', 'name email phone role profileImage equippedAvatar')
-      .sort({ createdAt: 1 })
+      .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
 
     // Mark group messages as read asynchronously in background
     Message.updateMany(
-      { groupId, readBy: { $ne: userId } },
+      { ...groupCondition, readBy: { $ne: userId } },
       { $addToSet: { readBy: userId } }
     ).catch(err => console.warn('Background group read error:', err.message));
 
-    res.json(messages);
+    res.json(messages.reverse());
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

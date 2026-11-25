@@ -23,5 +23,6 @@ const friendshipSchema = new mongoose.Schema({
 // Compound index to speed up lookups and prevent duplicate requests
 friendshipSchema.index({ requester: 1, recipient: 1 }, { unique: true });
 friendshipSchema.index({ recipient: 1, status: 1 });
+friendshipSchema.index({ requester: 1, status: 1 });
 
 module.exports = mongoose.model('Friendship', friendshipSchema);

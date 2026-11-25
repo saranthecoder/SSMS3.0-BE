@@ -12,11 +12,11 @@ const dailyWorkloadSchema = new mongoose.Schema({
   },
   onsiteAllocated: {
     type: Boolean,
-    default: false
+    default: true
   },
   onsiteMinHours: {
     type: Number,
-    default: 2
+    default: 4
   },
   onsiteMaxHours: {
     type: Number,
@@ -24,15 +24,43 @@ const dailyWorkloadSchema = new mongoose.Schema({
   },
   wfhAllocated: {
     type: Boolean,
-    default: false
+    default: true
   },
   wfhMinHours: {
     type: Number,
-    default: 3
+    default: 4
   },
   wfhMaxHours: {
     type: Number,
     default: 10
+  },
+  autoWfhEnabled: {
+    type: Boolean,
+    default: true
+  },
+  autoWfhTime: {
+    type: String, // HH:mm format, e.g. "19:00"
+    default: '19:00'
+  },
+  autoWfhGranted: {
+    type: Boolean,
+    default: false
+  },
+  autoOnsiteCheckoutEnabled: {
+    type: Boolean,
+    default: true
+  },
+  autoOnsiteCheckoutTime: {
+    type: String, // HH:mm format, e.g. "17:00"
+    default: '17:00'
+  },
+  autoOnsiteCheckoutDone: {
+    type: Boolean,
+    default: false
+  },
+  notes: {
+    type: String,
+    default: ''
   },
   updatedBy: {
     type: mongoose.Schema.Types.ObjectId,

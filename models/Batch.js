@@ -79,6 +79,22 @@ const batchSchema = new mongoose.Schema({
   wfhMaxHours: {
     type: Number,
     default: 10
+  },
+  autoWfhEnabled: {
+    type: Boolean,
+    default: true
+  },
+  autoWfhTime: {
+    type: String, // format "HH:MM" e.g., "19:00"
+    default: '19:00'
+  },
+  autoOnsiteCheckoutEnabled: {
+    type: Boolean,
+    default: true
+  },
+  autoOnsiteCheckoutTime: {
+    type: String, // format "HH:MM" e.g., "17:00"
+    default: '17:00'
   }
 }, {
   timestamps: true

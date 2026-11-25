@@ -58,5 +58,6 @@ chatGroupSchema.index({ 'members.user': 1 });
 chatGroupSchema.index({ creatorId: 1 });
 chatGroupSchema.index({ batchId: 1 });
 chatGroupSchema.index({ batchId: 1, isBatchCommon: 1 });
+chatGroupSchema.index({ isArchived: 1, isBatchCommon: 1 });
 
 module.exports = mongoose.model('ChatGroup', chatGroupSchema);
