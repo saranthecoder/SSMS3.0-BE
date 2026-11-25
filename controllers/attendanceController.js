@@ -398,9 +398,17 @@ const checkIn = async (req, res) => {
     const resolvedOnsiteAlloc = access.onsiteAllocated !== undefined ? access.onsiteAllocated : (dailyWl ? dailyWl.onsiteAllocated : !isWfh);
     const resolvedWfhAlloc = access.wfhAllocated !== undefined ? access.wfhAllocated : (dailyWl ? dailyWl.wfhAllocated : isWfh);
 
+    const targetMode = access.accessType || 'on-site';
     if (attendance) {
       if (attendance.isActive) {
-        return res.status(200).json(attendance);
+        if (attendance.accessType === targetMode) {
+          return res.status(200).json(attendance);
+        }
+        // Mode changed while still checked in: commit elapsed seconds of previous mode before switching
+        const prevElapsed = attendance.lastCheckInTime
+          ? Math.max(0, Math.floor((Date.now() - new Date(attendance.lastCheckInTime).getTime()) / 1000))
+          : 0;
+        evaluateAttendanceRecord(attendance, prevElapsed);
       }
       attendance.lastCheckInTime = Date.now();
       attendance.isActive = true;

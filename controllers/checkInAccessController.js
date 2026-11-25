@@ -277,6 +277,17 @@ const grantAccess = async (req, res) => {
       });
 
       for (const att of todayAttendances) {
+        // If student is actively checked in under a DIFFERENT mode, commit & close the old session first
+        // so its hours are saved under the old mode and the student can cleanly Check In to the new mode.
+        if (att.isActive && att.accessType && att.accessType !== type) {
+          const prevElapsed = att.lastCheckInTime
+            ? Math.max(0, Math.floor((Date.now() - new Date(att.lastCheckInTime).getTime()) / 1000))
+            : 0;
+          att.isActive = false;
+          att.checkOutTime = Date.now();
+          evaluateAttendanceRecord(att, prevElapsed);
+        }
+
         att.workHours = effWorkHours;
         att.minRequiredHours = effMinHours;
         att.maxValidHours = effMaxHours;
@@ -422,7 +433,22 @@ const getTodayAccess = async (req, res) => {
     ]);
 
     const sIds = grants.map(g => g.studentId?._id || g.studentId).filter(Boolean);
-    const attendances = await Attendance.find({ studentId: { $in: sIds }, dateStr }).lean();
+    const rawAttendances = await Attendance.find({ studentId: { $in: sIds }, dateStr }).lean();
+    const nowMs = Date.now();
+    const attendances = rawAttendances.map(a => {
+      if (a.isActive && a.lastCheckInTime) {
+        const delta = Math.max(0, Math.floor((nowMs - new Date(a.lastCheckInTime).getTime()) / 1000));
+        const liveOnsite = (a.onsiteDurationSeconds || 0) + (a.accessType === 'wfh' ? 0 : delta);
+        const liveWfh = (a.wfhDurationSeconds || 0) + (a.accessType === 'wfh' ? delta : 0);
+        return {
+          ...a,
+          onsiteDurationSeconds: liveOnsite,
+          wfhDurationSeconds: liveWfh,
+          sessionDurationSeconds: liveOnsite + liveWfh
+        };
+      }
+      return a;
+    });
     const attMap = {};
     attendances.forEach(a => {
       attMap[a.studentId.toString()] = a;
