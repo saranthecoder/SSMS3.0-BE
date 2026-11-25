@@ -74,27 +74,45 @@ const getBatchHourLimits = async (studentId, dateStr = null, forcedAccessType = 
   };
 };
 
+// Helper: Attribute any unsplit sessionDurationSeconds to the active bucket so totals never lose On-Site/WFH hours
+const reconcileSplitSeconds = (currentDuration, currentOnsite, currentWfh, accessType) => {
+  const splitSum = currentOnsite + currentWfh;
+  if (currentDuration > splitSum) {
+    const unsplit = currentDuration - splitSum;
+    if (accessType === 'wfh') {
+      return { onsite: currentOnsite, wfh: currentWfh + unsplit };
+    }
+    return { onsite: currentOnsite + unsplit, wfh: currentWfh };
+  }
+  return { onsite: currentOnsite, wfh: currentWfh };
+};
+
 // Helper: Evaluate attendance records maintaining On-Site and WFH records separately
 const evaluateAttendanceRecord = (record, additionalSeconds = 0) => {
   const currentAccessType = record.accessType || 'on-site';
-  
+
+  // Recover any unsplit sessionDurationSeconds before adding additionalSeconds
+  const reconciled = reconcileSplitSeconds(
+    record.sessionDurationSeconds || 0,
+    record.onsiteDurationSeconds || 0,
+    record.wfhDurationSeconds || 0,
+    currentAccessType
+  );
+  if (reconciled.onsite > (record.onsiteDurationSeconds || 0)) {
+    record.onsiteDurationSeconds = reconciled.onsite;
+    record.onsiteAllocated = true;
+  }
+  if (reconciled.wfh > (record.wfhDurationSeconds || 0)) {
+    record.wfhDurationSeconds = reconciled.wfh;
+    record.wfhAllocated = true;
+  }
+
   if (additionalSeconds > 0) {
     if (currentAccessType === 'wfh') {
       record.wfhDurationSeconds = (record.wfhDurationSeconds || 0) + additionalSeconds;
       record.wfhAllocated = true;
     } else {
       record.onsiteDurationSeconds = (record.onsiteDurationSeconds || 0) + additionalSeconds;
-      record.onsiteAllocated = true;
-    }
-  }
-
-  // Ensure legacy records get their sessionDurationSeconds attributed
-  if ((!record.onsiteDurationSeconds && !record.wfhDurationSeconds) && (record.sessionDurationSeconds || 0) > 0) {
-    if (currentAccessType === 'wfh') {
-      record.wfhDurationSeconds = record.sessionDurationSeconds;
-      record.wfhAllocated = true;
-    } else {
-      record.onsiteDurationSeconds = record.sessionDurationSeconds;
       record.onsiteAllocated = true;
     }
   }
@@ -704,15 +722,15 @@ const getAttendanceSummary = async (req, res) => {
     }
     
     const summaryList = logs.map(log => {
-      let currentDuration = log.sessionDurationSeconds || 0;
-      let currentOnsite = log.onsiteDurationSeconds || 0;
-      let currentWfh = log.wfhDurationSeconds || 0;
-
-      // Handle legacy records where onsite/wfh wasn't split
-      if (!currentOnsite && !currentWfh && currentDuration > 0) {
-        if (log.accessType === 'wfh') currentWfh = currentDuration;
-        else currentOnsite = currentDuration;
-      }
+      const reconciled = reconcileSplitSeconds(
+        log.sessionDurationSeconds || 0,
+        log.onsiteDurationSeconds || 0,
+        log.wfhDurationSeconds || 0,
+        log.accessType || 'on-site'
+      );
+      let currentOnsite = reconciled.onsite;
+      let currentWfh = reconciled.wfh;
+      let currentDuration = Math.max(log.sessionDurationSeconds || 0, currentOnsite + currentWfh);
 
       if (log.isActive) {
         const delta = Math.floor((Date.now() - new Date(log.lastCheckInTime).getTime()) / 1000);
@@ -813,14 +831,15 @@ const getMyAttendanceSummary = async (req, res) => {
       .lean();
     
     const summaryList = logs.map(log => {
-      let currentDuration = log.sessionDurationSeconds || 0;
-      let currentOnsite = log.onsiteDurationSeconds || 0;
-      let currentWfh = log.wfhDurationSeconds || 0;
-
-      if (!currentOnsite && !currentWfh && currentDuration > 0) {
-        if (log.accessType === 'wfh') currentWfh = currentDuration;
-        else currentOnsite = currentDuration;
-      }
+      const reconciled = reconcileSplitSeconds(
+        log.sessionDurationSeconds || 0,
+        log.onsiteDurationSeconds || 0,
+        log.wfhDurationSeconds || 0,
+        log.accessType || 'on-site'
+      );
+      let currentOnsite = reconciled.onsite;
+      let currentWfh = reconciled.wfh;
+      let currentDuration = Math.max(log.sessionDurationSeconds || 0, currentOnsite + currentWfh);
 
       if (log.isActive) {
         const delta = Math.floor((Date.now() - new Date(log.lastCheckInTime).getTime()) / 1000);
@@ -1150,14 +1169,15 @@ const getPublicAttendanceSummary = async (req, res) => {
       const maxHours = grant?.maxHours || log?.maxValidHours || 10;
       const studentLeave = leavesMap[sId];
       
-      let currentDuration = log ? (log.sessionDurationSeconds || 0) : 0;
-      let currentOnsite = log ? (log.onsiteDurationSeconds || 0) : 0;
-      let currentWfh = log ? (log.wfhDurationSeconds || 0) : 0;
-
-      if (!currentOnsite && !currentWfh && currentDuration > 0) {
-        if (accessType === 'wfh') currentWfh = currentDuration;
-        else currentOnsite = currentDuration;
-      }
+      const reconciled = reconcileSplitSeconds(
+        log ? (log.sessionDurationSeconds || 0) : 0,
+        log ? (log.onsiteDurationSeconds || 0) : 0,
+        log ? (log.wfhDurationSeconds || 0) : 0,
+        accessType
+      );
+      let currentOnsite = reconciled.onsite;
+      let currentWfh = reconciled.wfh;
+      let currentDuration = Math.max(log ? (log.sessionDurationSeconds || 0) : 0, currentOnsite + currentWfh);
 
       if (log && log.isActive) {
         const delta = Math.floor((Date.now() - new Date(log.lastCheckInTime).getTime()) / 1000);

@@ -215,6 +215,7 @@ app.get(['/health/ready', '/api/health/ready', '/health/readiness', '/api/health
   if (isDbReady) {
     return res.status(200).json({
       status: 'ready',
+      apiVersion: trafficRoutes.BACKEND_API_VERSION || '3.2.0',
       uptime: Math.floor(process.uptime()),
       dependencies: { database: 'connected' },
       timestamp: Date.now(),
@@ -246,6 +247,7 @@ app.get(['/health', '/api/health'], (req, res) => {
   const statusCode = isDbReady ? 200 : 503;
   res.status(statusCode).json({
     status: isDbReady ? 'ok' : 'degraded',
+    apiVersion: trafficRoutes.BACKEND_API_VERSION || '3.2.0',
     uptime: Math.floor(process.uptime()),
     ready: isDbReady,
     timestamp: Date.now(),
@@ -397,6 +399,27 @@ const selfPing = () => {
 
 // Initiate self-pinging routine
 selfPing();
+
+// Background cluster health probe (runs every 5 minutes via distributed lock so nodes never go stale when no admin tab is open)
+if (typeof trafficRoutes.probeRegisteredServers === 'function') {
+  const selfHost = (() => {
+    try {
+      return process.env.RENDER_EXTERNAL_URL ? new URL(process.env.RENDER_EXTERNAL_URL).host : '';
+    } catch {
+      return '';
+    }
+  })();
+  setTimeout(() => {
+    runDistributedJob('cluster_health_probe', 45000, 240000, async () => {
+      await trafficRoutes.probeRegisteredServers(selfHost);
+    });
+  }, 3000);
+  setInterval(async () => {
+    await runDistributedJob('cluster_health_probe', 45000, 240000, async () => {
+      await trafficRoutes.probeRegisteredServers(selfHost);
+    });
+  }, 5 * 60 * 1000);
+}
 
 // Auto-Checkout & Batch Lifecycle Routine: Runs every 60 seconds with distributed lock coordination across instances
 const { processBatchAutoCheckouts, autoCloseAllOldSessions } = require('./controllers/attendanceController');

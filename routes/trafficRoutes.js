@@ -43,6 +43,7 @@ router.get('/public-config', async (req, res) => {
     const reqHost = (req.get('host') || '').toLowerCase();
 
     res.json({
+      apiVersion: BACKEND_API_VERSION,
       policy: config ? config.policy : 'round-robin',
       cpuThreshold: config ? config.cpuThreshold : 80,
       manualSelectedServerId: config ? config.manualSelectedServerId : null,
@@ -311,159 +312,173 @@ router.post('/config', protect, admin, async (req, res) => {
   }
 });
 
+const BACKEND_API_VERSION = '3.2.0';
+
+/**
+ * Probes all active registered backend servers using versioned health endpoints and updates DB telemetry.
+ */
+async function probeRegisteredServers(reqHost = '') {
+  const servers = await BackendServer.find({ isActive: true });
+  const config = await TrafficConfig.findOne();
+  const requestsCount = config ? (config.requestsPerPing || 1) : 1;
+  const pingResults = [];
+
+  const localMetrics = metricsService.getSnapshot();
+  const FAILURE_THRESHOLD = 2;
+  const PROBE_TIMEOUT_MS = 5000;
+  const normalizedHost = (reqHost || '').toLowerCase();
+
+  for (const server of servers) {
+    let totalLatency = 0;
+    let successfulReqs = 0;
+    let lastFailureReason = '';
+    let latestHealthData = null;
+    let incompatibleVersionReason = '';
+    const cleanUrl = server.url.trim().endsWith('/') ? server.url.trim().slice(0, -1) : server.url.trim();
+    const isCurrentInstance = server.url.includes('localhost') || (normalizedHost && server.url.toLowerCase().includes(normalizedHost));
+
+    for (let i = 0; i < requestsCount; i++) {
+      const startTime = Date.now();
+      let probeSucceeded = false;
+      let responseStatus = null;
+      let candidateError = null;
+
+      // Probe only versioned health endpoints so legacy or mismatched builds are flagged offline immediately
+      const candidateEndpoints = [
+        `${cleanUrl}/api/health/ready`,
+        `${cleanUrl}/api/health`
+      ];
+
+      for (const endpoint of candidateEndpoints) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+          const response = await fetch(endpoint, {
+            signal: controller.signal,
+            headers: { 'Accept': 'application/json' }
+          });
+          clearTimeout(timeoutId);
+
+          if (response && response.ok) {
+            const data = await response.json().catch(() => null);
+            const isHealthyStatus = data && (data.status === 'ok' || data.status === 'ready');
+            if (isHealthyStatus) {
+              // Enforce strict apiVersion match across remote nodes so rolling/legacy mismatches are quarantined immediately
+              if (!isCurrentInstance && data.apiVersion !== BACKEND_API_VERSION) {
+                incompatibleVersionReason = `Version mismatch (expected ${BACKEND_API_VERSION}, got ${data.apiVersion || 'legacy'}). Auto-quarantined until redeployed.`;
+                break;
+              }
+              probeSucceeded = true;
+              totalLatency += (Date.now() - startTime);
+              successfulReqs++;
+              latestHealthData = data;
+              break;
+            }
+            responseStatus = 'Invalid health payload';
+          } else if (response) {
+            responseStatus = `HTTP ${response.status}`;
+            if (response.status === 404 && endpoint.endsWith('/api/health')) {
+              incompatibleVersionReason = `Outdated backend build (/api/health 404; expected ${BACKEND_API_VERSION}). Redeploy service from latest SSMS-BE.`;
+            }
+          }
+        } catch (err) {
+          candidateError = err.name === 'AbortError' ? `Probe timed out (${PROBE_TIMEOUT_MS / 1000}s)` : err.message;
+        }
+      }
+
+      if (!probeSucceeded) {
+        lastFailureReason = incompatibleVersionReason || responseStatus || candidateError || 'Unknown response';
+      }
+    }
+
+    server.lastHealthCheck = new Date();
+
+    if (successfulReqs > 0) {
+      const avgResponseTime = Math.round(totalLatency / successfulReqs);
+      server.consecutiveSuccesses = (server.consecutiveSuccesses || 0) + 1;
+      server.consecutiveFailures = 0;
+      server.failureReason = '';
+      server.responseTime = avgResponseTime;
+
+      if (isCurrentInstance) {
+        server.cpuUsage = localMetrics.cpuPercent;
+        server.memoryUsage = localMetrics.memoryPercent;
+        server.avgProcessingLatencyMs = localMetrics.avgProcessingLatencyMs;
+        if (typeof localMetrics.appRequests === 'number') server.requestCount = localMetrics.appRequests;
+        if (typeof localMetrics.appRpm === 'number') server.reqPerMin = localMetrics.appRpm;
+      } else if (latestHealthData && typeof latestHealthData.cpuPercent === 'number') {
+        server.cpuUsage = latestHealthData.cpuPercent;
+        server.memoryUsage = typeof latestHealthData.memoryPercent === 'number' ? latestHealthData.memoryPercent : null;
+        server.avgProcessingLatencyMs = typeof latestHealthData.avgProcessingLatencyMs === 'number' ? latestHealthData.avgProcessingLatencyMs : null;
+        if (typeof latestHealthData.appRequests === 'number') server.requestCount = latestHealthData.appRequests;
+        if (typeof latestHealthData.appRpm === 'number') server.reqPerMin = latestHealthData.appRpm;
+      } else {
+        server.cpuUsage = null;
+        server.memoryUsage = null;
+        server.avgProcessingLatencyMs = null;
+      }
+
+      server.status = 'online';
+      await server.save();
+
+      pingResults.push({
+        id: server._id.toString(),
+        _id: server._id.toString(),
+        name: server.name,
+        url: server.url,
+        status: server.status,
+        responseTime: avgResponseTime,
+        avgProcessingLatencyMs: server.avgProcessingLatencyMs,
+        consecutiveSuccesses: server.consecutiveSuccesses,
+        consecutiveFailures: 0,
+        lastHealthCheck: server.lastHealthCheck,
+        cpuUsage: server.cpuUsage,
+        memoryUsage: server.memoryUsage,
+        requestsSent: requestsCount
+      });
+    } else {
+      server.consecutiveFailures = (server.consecutiveFailures || 0) + 1;
+      server.consecutiveSuccesses = 0;
+      server.failureReason = lastFailureReason;
+      server.cpuUsage = null;
+      server.memoryUsage = null;
+      server.avgProcessingLatencyMs = null;
+
+      if (incompatibleVersionReason || server.consecutiveFailures >= FAILURE_THRESHOLD) {
+        server.consecutiveFailures = Math.max(FAILURE_THRESHOLD, server.consecutiveFailures);
+        server.status = 'offline';
+        server.responseTime = 0;
+      }
+
+      await server.save();
+
+      pingResults.push({
+        id: server._id.toString(),
+        _id: server._id.toString(),
+        name: server.name,
+        url: server.url,
+        status: server.status,
+        failureReason: lastFailureReason,
+        responseTime: 0,
+        avgProcessingLatencyMs: null,
+        consecutiveFailures: server.consecutiveFailures,
+        consecutiveSuccesses: 0,
+        lastHealthCheck: server.lastHealthCheck,
+        cpuUsage: null,
+        memoryUsage: null,
+        requestsSent: requestsCount
+      });
+    }
+  }
+  return pingResults;
+}
+
 // @route   POST /api/traffic/ping
 // @desc    Triggers background ping test on all active servers from the backend perspective
 // @access  Private/Admin
 router.post('/ping', protect, admin, async (req, res) => {
   try {
-    const servers = await BackendServer.find({ isActive: true });
-    const config = await TrafficConfig.findOne();
-    const requestsCount = config ? (config.requestsPerPing || 1) : 1;
-    const pingResults = [];
-
-    const localMetrics = metricsService.getSnapshot();
-    const FAILURE_THRESHOLD = 2;
-    const PROBE_TIMEOUT_MS = 5000; // 5s bounded timeout to accommodate remote hops
-
-    for (const server of servers) {
-      let totalLatency = 0;
-      let successfulReqs = 0;
-      let lastFailureReason = '';
-      let latestHealthData = null;
-      const cleanUrl = server.url.trim().endsWith('/') ? server.url.trim().slice(0, -1) : server.url.trim();
-
-      for (let i = 0; i < requestsCount; i++) {
-        const startTime = Date.now();
-        let probeSucceeded = false;
-        let responseStatus = null;
-        let candidateError = null;
-
-        const candidateEndpoints = [
-          `${cleanUrl}/api/health/ready`,
-          `${cleanUrl}/api/health`,
-          `${cleanUrl}/api/traffic/public-config`,
-          `${cleanUrl}/`
-        ];
-
-        for (const endpoint of candidateEndpoints) {
-          try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
-            const response = await fetch(endpoint, {
-              signal: controller.signal,
-              headers: { 'Accept': 'application/json, text/plain, */*' }
-            });
-            clearTimeout(timeoutId);
-
-            if (response && response.ok) {
-              probeSucceeded = true;
-              totalLatency += (Date.now() - startTime);
-              successfulReqs++;
-              try {
-                const data = await response.json();
-                if (data && typeof data === 'object') {
-                  latestHealthData = data;
-                }
-              } catch {
-                // Non-JSON response is still a valid alive probe
-              }
-              break;
-            } else if (response) {
-              responseStatus = `HTTP ${response.status}`;
-            }
-          } catch (err) {
-            candidateError = err.name === 'AbortError' ? `Probe timed out (${PROBE_TIMEOUT_MS / 1000}s)` : err.message;
-          }
-        }
-
-        if (!probeSucceeded) {
-          lastFailureReason = responseStatus || candidateError || 'Unknown response';
-        }
-      }
-
-      server.lastHealthCheck = new Date();
-      const reqHost = (req.get('host') || '').toLowerCase();
-      const isCurrentInstance = server.url.includes('localhost') || (reqHost && server.url.toLowerCase().includes(reqHost));
-
-      if (successfulReqs > 0) {
-        const avgResponseTime = Math.round(totalLatency / successfulReqs);
-        server.consecutiveSuccesses = (server.consecutiveSuccesses || 0) + 1;
-        server.consecutiveFailures = 0;
-        server.failureReason = '';
-        server.responseTime = avgResponseTime;
-
-        if (isCurrentInstance) {
-          server.cpuUsage = localMetrics.cpuPercent;
-          server.memoryUsage = localMetrics.memoryPercent;
-          server.avgProcessingLatencyMs = localMetrics.avgProcessingLatencyMs;
-          if (typeof localMetrics.appRequests === 'number') server.requestCount = localMetrics.appRequests;
-          if (typeof localMetrics.appRpm === 'number') server.reqPerMin = localMetrics.appRpm;
-        } else if (latestHealthData && typeof latestHealthData.cpuPercent === 'number') {
-          server.cpuUsage = latestHealthData.cpuPercent;
-          server.memoryUsage = typeof latestHealthData.memoryPercent === 'number' ? latestHealthData.memoryPercent : null;
-          server.avgProcessingLatencyMs = typeof latestHealthData.avgProcessingLatencyMs === 'number' ? latestHealthData.avgProcessingLatencyMs : null;
-          if (typeof latestHealthData.appRequests === 'number') server.requestCount = latestHealthData.appRequests;
-          if (typeof latestHealthData.appRpm === 'number') server.reqPerMin = latestHealthData.appRpm;
-        } else {
-          server.cpuUsage = null;
-          server.memoryUsage = null;
-          server.avgProcessingLatencyMs = null;
-        }
-
-        // Immediately update status to online upon verified successful response
-        server.status = 'online';
-
-        await server.save();
-
-        pingResults.push({
-          id: server._id.toString(),
-          _id: server._id.toString(),
-          name: server.name,
-          url: server.url,
-          status: server.status,
-          responseTime: avgResponseTime,
-          avgProcessingLatencyMs: server.avgProcessingLatencyMs,
-          consecutiveSuccesses: server.consecutiveSuccesses,
-          consecutiveFailures: 0,
-          lastHealthCheck: server.lastHealthCheck,
-          cpuUsage: server.cpuUsage,
-          memoryUsage: server.memoryUsage,
-          requestsSent: requestsCount
-        });
-      } else {
-        server.consecutiveFailures = (server.consecutiveFailures || 0) + 1;
-        server.consecutiveSuccesses = 0;
-        server.failureReason = lastFailureReason;
-        server.cpuUsage = null;
-        server.memoryUsage = null;
-        server.avgProcessingLatencyMs = null;
-
-        // Trip offline status once failure threshold is reached
-        if (server.consecutiveFailures >= FAILURE_THRESHOLD) {
-          server.status = 'offline';
-          server.responseTime = 0;
-        }
-
-        await server.save();
-
-        pingResults.push({
-          id: server._id.toString(),
-          _id: server._id.toString(),
-          name: server.name,
-          url: server.url,
-          status: server.status,
-          failureReason: lastFailureReason,
-          responseTime: 0,
-          avgProcessingLatencyMs: null,
-          consecutiveFailures: server.consecutiveFailures,
-          consecutiveSuccesses: 0,
-          lastHealthCheck: server.lastHealthCheck,
-          cpuUsage: null,
-          memoryUsage: null,
-          requestsSent: requestsCount
-        });
-      }
-    }
+    const pingResults = await probeRegisteredServers(req.get('host') || '');
     res.json(pingResults);
   } catch (error) {
     res.status(500).json({ message: 'Error performing ping checks', error: error.message });
@@ -606,5 +621,8 @@ router.post('/render-usage/refresh', protect, admin, async (req, res) => {
     res.status(500).json({ message: 'Error refreshing hosting usage', error: error.message });
   }
 });
+
+router.BACKEND_API_VERSION = BACKEND_API_VERSION;
+router.probeRegisteredServers = probeRegisteredServers;
 
 module.exports = router;
