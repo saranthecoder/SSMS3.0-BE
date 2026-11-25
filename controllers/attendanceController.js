@@ -1239,10 +1239,16 @@ const getPublicAttendanceSummary = async (req, res) => {
 const updateAttendanceRecord = async (req, res) => {
   try {
     const { id } = req.params;
-    const { dateStr, hours, status } = req.body;
+    const { dateStr, hours, onsiteHours, wfhHours, status } = req.body;
+
+    const hasSplitHours = onsiteHours !== undefined || wfhHours !== undefined;
+    const onsiteSec = hasSplitHours ? Math.max(0, Math.round(Number(onsiteHours || 0) * 3600)) : null;
+    const wfhSec = hasSplitHours ? Math.max(0, Math.round(Number(wfhHours || 0) * 3600)) : null;
+    const totalSec = hasSplitHours
+      ? (onsiteSec + wfhSec)
+      : Math.max(0, Math.round(Number(hours || 0) * 3600));
 
     let record;
-    const totalSec = Math.round(Number(hours) * 3600);
     if (id.startsWith('absent_')) {
       const studentId = id.replace('absent_', '');
       record = new Attendance({
@@ -1252,8 +1258,10 @@ const updateAttendanceRecord = async (req, res) => {
         lastCheckInTime: new Date(),
         checkOutTime: new Date(),
         sessionDurationSeconds: totalSec,
-        onsiteDurationSeconds: totalSec,
-        wfhDurationSeconds: 0,
+        onsiteDurationSeconds: hasSplitHours ? onsiteSec : totalSec,
+        wfhDurationSeconds: hasSplitHours ? wfhSec : 0,
+        onsiteAllocated: hasSplitHours ? onsiteSec > 0 : totalSec > 0,
+        wfhAllocated: hasSplitHours ? wfhSec > 0 : false,
         status,
         isActive: false
       });
@@ -1263,13 +1271,21 @@ const updateAttendanceRecord = async (req, res) => {
         return res.status(404).json({ message: 'Attendance record not found' });
       }
       record.sessionDurationSeconds = totalSec;
-      if (record.accessType === 'wfh') {
+      if (hasSplitHours) {
+        record.onsiteDurationSeconds = onsiteSec;
+        record.wfhDurationSeconds = wfhSec;
+        if (onsiteSec > 0) record.onsiteAllocated = true;
+        if (wfhSec > 0) record.wfhAllocated = true;
+      } else if (record.accessType === 'wfh') {
         record.wfhDurationSeconds = totalSec;
       } else {
         record.onsiteDurationSeconds = totalSec;
       }
       record.status = status;
-      record.checkOutTime = record.checkOutTime || new Date();
+      if (status !== 'In Progress') {
+        record.isActive = false;
+        record.checkOutTime = record.checkOutTime || new Date();
+      }
     }
 
     await record.save();
