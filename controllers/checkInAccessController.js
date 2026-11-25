@@ -62,6 +62,15 @@ const triggerAutoWfhGrant = async (batchId, dateStr = getISTDateStr()) => {
 
       const att = await Attendance.findOne({ studentId: sId, dateStr });
       if (att) {
+        if (att.isActive && att.accessType !== 'wfh') {
+          const { evaluateAttendanceRecord } = require('./attendanceController');
+          const prevElapsed = att.lastCheckInTime
+            ? Math.max(0, Math.floor((Date.now() - new Date(att.lastCheckInTime).getTime()) / 1000))
+            : 0;
+          att.isActive = false;
+          att.checkOutTime = Date.now();
+          evaluateAttendanceRecord(att, prevElapsed);
+        }
         att.wfhAllocated = true;
         att.wfhMinHours = effWfhMin;
         att.wfhMaxHours = effWfhMax;

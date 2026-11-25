@@ -735,8 +735,7 @@ const getAttendanceSummary = async (req, res) => {
       // Re-compute status against authoritative batch DailyWorkload if present
       let effStatus = log.status;
       if (wl && !log.isActive && !log.isLeave && log.status !== 'Leave') {
-        const totalMax = Math.max(effOnsiteMax, effWfhMax);
-        if (currentDuration > totalMax * 3600) {
+        if (currentOnsite > effOnsiteMax * 3600 || currentWfh > effWfhMax * 3600) {
           effStatus = 'Invalid';
         } else {
           const onsiteOk = !effOnsiteAlloc || currentOnsite >= effOnsiteMin * 3600;
@@ -1184,10 +1183,10 @@ const getPublicAttendanceSummary = async (req, res) => {
 
       // Evaluate accurate day status (Present, In Progress, Invalid, Leave, Absent)
       let computedStatus = 'Absent';
-      const totalHours = currentDuration / 3600;
+      const isOvertime = (currentOnsite / 3600) > onsiteMaxHours || (currentWfh / 3600) > wfhMaxHours;
       if (log?.status === 'Leave' || (studentLeave && studentLeave.leaveType !== 'hours' && !log?.isActive && !bothMet)) {
         computedStatus = 'Leave';
-      } else if (log?.status === 'Invalid' || totalHours > maxHours) {
+      } else if (log?.status === 'Invalid' || isOvertime) {
         computedStatus = 'Invalid';
       } else if (bothMet && (currentOnsite > 0 || currentWfh > 0 || (log?.leaveHours || 0) > 0)) {
         computedStatus = 'Present';
