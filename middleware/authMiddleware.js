@@ -100,6 +100,10 @@ const protect = async (req, res, next) => {
       }
     } catch (error) {
       console.error(error);
+      const mongoose = require('mongoose');
+      if (mongoose.connection.readyState !== 1 || error?.name === 'MongooseError' || /buffering timed out|ECONNREFUSED|Topology/i.test(error?.message || '')) {
+        return res.status(503).json({ message: 'Database connection unavailable. Please try again.' });
+      }
     }
   }
   

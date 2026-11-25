@@ -674,6 +674,26 @@ const getAttendanceSummary = async (req, res) => {
       .populate('studentId', 'name email rollNumber')
       .sort({ dateStr: -1, createdAt: -1 })
       .lean();
+
+    // Load authoritative DailyWorkload benchmarks for the batch(es) so every student is evaluated against the batch policy
+    const DailyWorkload = require('../models/DailyWorkload');
+    const wlQuery = {};
+    if (batchId) {
+      wlQuery.batchId = batchId;
+    } else if (req.user.role === 'mentor') {
+      const mentorBatches = await Batch.find({ mentorId: req.user._id }).select('_id').lean();
+      wlQuery.batchId = { $in: mentorBatches.map(b => b._id) };
+    }
+    if (query.dateStr) {
+      wlQuery.dateStr = query.dateStr;
+    }
+    const dailyWorkloads = await DailyWorkload.find(wlQuery).sort({ updatedAt: -1 }).lean();
+    const wlByDate = new Map();
+    for (const wl of dailyWorkloads) {
+      if (!wlByDate.has(wl.dateStr)) {
+        wlByDate.set(wl.dateStr, wl);
+      }
+    }
     
     const summaryList = logs.map(log => {
       let currentDuration = log.sessionDurationSeconds || 0;
@@ -695,6 +715,27 @@ const getAttendanceSummary = async (req, res) => {
           currentOnsite += delta;
         }
       }
+
+      const wl = wlByDate.get(log.dateStr);
+      const effOnsiteMin = wl?.onsiteMinHours || log.onsiteMinHours || 2;
+      const effOnsiteMax = wl?.onsiteMaxHours || log.onsiteMaxHours || 10;
+      const effWfhMin = wl?.wfhMinHours || log.wfhMinHours || 3;
+      const effWfhMax = wl?.wfhMaxHours || log.wfhMaxHours || 10;
+      const effOnsiteAlloc = Boolean(log.onsiteAllocated || wl?.onsiteAllocated || (log.onsiteDurationSeconds > 0));
+      const effWfhAlloc = Boolean(log.wfhAllocated || wl?.wfhAllocated || (log.wfhDurationSeconds > 0));
+
+      // Re-compute status against authoritative batch DailyWorkload if present
+      let effStatus = log.status;
+      if (wl && !log.isActive && !log.isLeave && log.status !== 'Leave') {
+        const totalMax = Math.max(effOnsiteMax, effWfhMax);
+        if (currentDuration > totalMax * 3600) {
+          effStatus = 'Invalid';
+        } else {
+          const onsiteOk = !effOnsiteAlloc || currentOnsite >= effOnsiteMin * 3600;
+          const wfhOk = !effWfhAlloc || currentWfh >= effWfhMin * 3600;
+          effStatus = (onsiteOk && wfhOk && (currentOnsite > 0 || currentWfh > 0)) ? 'Present' : 'Absent';
+        }
+      }
       
       return {
         _id: log._id,
@@ -706,21 +747,21 @@ const getAttendanceSummary = async (req, res) => {
         totalSeconds: currentDuration,
         onsiteSeconds: currentOnsite,
         wfhSeconds: currentWfh,
-        onsiteMinHours: log.onsiteMinHours || 2,
-        onsiteMaxHours: log.onsiteMaxHours || 10,
-        wfhMinHours: log.wfhMinHours || 3,
-        wfhMaxHours: log.wfhMaxHours || 10,
-        onsiteAllocated: Boolean(log.onsiteAllocated || (log.onsiteDurationSeconds > 0)),
-        wfhAllocated: Boolean(log.wfhAllocated || (log.wfhDurationSeconds > 0)),
+        onsiteMinHours: effOnsiteMin,
+        onsiteMaxHours: effOnsiteMax,
+        wfhMinHours: effWfhMin,
+        wfhMaxHours: effWfhMax,
+        onsiteAllocated: effOnsiteAlloc,
+        wfhAllocated: effWfhAlloc,
         accessType: log.accessType || 'on-site',
         firstCheckIn: log.checkInTime,
         lastCheckOut: log.checkOutTime,
         isActive: log.isActive,
         isLeave: log.isLeave,
         leaveHours: log.leaveHours,
-        requiredPresentHours: log.minRequiredHours || log.workHours || (log.accessType === 'wfh' ? (log.wfhMinHours || 3) : (log.onsiteMinHours || 2)),
+        requiredPresentHours: log.minRequiredHours || log.workHours || (log.accessType === 'wfh' ? effWfhMin : effOnsiteMin),
         maxValidHours: log.maxValidHours || 10,
-        status: log.status
+        status: effStatus
       };
     });
     

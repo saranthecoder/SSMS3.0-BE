@@ -10,12 +10,14 @@ const addGrade = async (req, res) => {
   try {
     const { submissionId, marksObtained, feedback } = req.body;
 
-    const submission = await Submission.findById(submissionId).populate('taskId');
+    const [submission, gradeExists] = await Promise.all([
+      Submission.findById(submissionId).populate('taskId'),
+      Grade.findOne({ submissionId }).select('_id').lean()
+    ]);
+
     if (!submission) {
       return res.status(404).json({ message: 'Submission not found' });
     }
-
-    const gradeExists = await Grade.findOne({ submissionId });
     if (gradeExists) {
       return res.status(400).json({ message: 'Submission already graded. Use update instead.' });
     }
@@ -42,23 +44,24 @@ const addGrade = async (req, res) => {
       finalFeedback += `\n[Auto-Grading Late Penalty: -${latePenalty} mark(s) for ${delayHours} hr(s) delay. Original: ${rawMarks}, Final: ${finalMarks}]`;
     }
 
-    const grade = await Grade.create({
-      submissionId,
-      marksObtained: finalMarks,
-      rawMarks,
-      latePenalty,
-      delayHours,
-      feedback: finalFeedback,
-      reviewedBy: req.user._id
-    });
+    const User = require('../models/User');
+    const [grade, studentUser] = await Promise.all([
+      Grade.create({
+        submissionId,
+        marksObtained: finalMarks,
+        rawMarks,
+        latePenalty,
+        delayHours,
+        feedback: finalFeedback,
+        reviewedBy: req.user._id
+      }),
+      submission.studentId ? User.findById(submission.studentId) : Promise.resolve(null)
+    ]);
 
-    // Update submission status
     submission.status = 'graded';
-    await submission.save();
+    const savePromises = [];
 
     // Gamification rewards for student (respecting 10x marks coins rule and avoiding duplicate awards)
-    const User = require('../models/User');
-    const studentUser = await User.findById(submission.studentId);
     if (studentUser) {
       const maxMarks = submission.taskId?.maxMarks || 100;
       const percentage = maxMarks > 0 ? (marksObtained / maxMarks) * 100 : 0;
@@ -104,24 +107,26 @@ const addGrade = async (req, res) => {
       const actualXP = awardXPWithCap(studentUser, pointsReward, `Grade: ${percentage.toFixed(0)}%`, isProject);
       checkAndAwardBadges(studentUser);
       
-      await studentUser.save();
-
       if (actualCoins > 0) {
         submission.coinsAwarded = alreadyAwarded + actualCoins;
-        await submission.save();
       }
+
+      savePromises.push(studentUser.save());
 
       if (actualCoins > 0 || (actualXP.actual || 0) > 0) {
         const GamificationEvent = require('../models/GamificationEvent');
-        await GamificationEvent.create({
+        savePromises.push(GamificationEvent.create({
           userId: studentUser._id,
           eventType: 'coins_earned',
           coinsChange: actualCoins,
           xpChange: actualXP.actual || 0,
           reason: `Grade: ${percentage.toFixed(0)}% for "${submission.taskId?.title || 'Task'}"`
-        });
+        }));
       }
     }
+
+    savePromises.push(submission.save());
+    await Promise.all(savePromises);
 
     // Invalidate student analytics cache immediately
     if (submission.studentId) {
@@ -243,32 +248,51 @@ const getGradeBySubmission = async (req, res) => {
   }
 };
 
-// @desc    Auto evaluate pending submissions
+// @desc    Auto evaluate pending submissions (supports single submissionId or sector batch submissionIds)
 // @route   POST /api/grades/auto-evaluate
 // @access  Private/Admin
 const autoEvaluateSubmissions = async (req, res) => {
   try {
-    // 1. Find pending submissions (all, or just one if specified)
+    // 1. Find pending submissions (single, sector array, or all)
     const query = { status: 'submitted' };
-    if (req.body.submissionId) {
+    if (Array.isArray(req.body.submissionIds) && req.body.submissionIds.length > 0) {
+      query._id = { $in: req.body.submissionIds.slice(0, 100) };
+    } else if (req.body.submissionId) {
       query._id = req.body.submissionId;
     }
     const pendingSubmissions = await Submission.find(query).populate('taskId');
     
     if (pendingSubmissions.length === 0) {
-      return res.status(200).json({ message: 'No pending submissions to evaluate', count: 0 });
+      return res.status(200).json({ message: 'No pending submissions to evaluate', count: 0, sectorSize: 0 });
     }
 
+    // Batch-check existing grades to avoid N+1 queries
+    const subIds = pendingSubmissions.map(s => s._id);
+    const existingGrades = await Grade.find({ submissionId: { $in: subIds } }).select('submissionId').lean();
+    const gradedIdSet = new Set(existingGrades.map(g => g.submissionId.toString()));
+
+    // Batch-load all involved student users once
+    const User = require('../models/User');
+    const GamificationEvent = require('../models/GamificationEvent');
+    const { awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges } = require('../utils/gamification');
+
+    const studentIds = [...new Set(pendingSubmissions.map(s => s.studentId?.toString()).filter(Boolean))];
+    const studentDocs = await User.find({ _id: { $in: studentIds } });
+    const studentMap = new Map(studentDocs.map(u => [u._id.toString(), u]));
+    const touchedStudents = new Set();
+
+    const gradesToCreate = [];
+    const submissionOps = [];
+    const gamificationEvents = [];
     let evaluatedCount = 0;
 
-    // 2. Iterate through and grade
+    // 2. Compute grades & rewards for this sector
     for (const submission of pendingSubmissions) {
       const task = submission.taskId;
-      if (!task) continue; // Safety check
+      if (!task) continue;
+      if (gradedIdSet.has(submission._id.toString())) continue;
 
       const submissionDate = new Date(submission.submittedAt || submission.createdAt);
-      
-      // Use task's exact deadline; only default legacy dates at midnight to 23:59:59
       const dueDate = new Date(task.dueDate);
       if (dueDate.getHours() === 0 && dueDate.getMinutes() === 0 && dueDate.getSeconds() === 0) {
         dueDate.setHours(23, 59, 59, 999);
@@ -280,104 +304,118 @@ const autoEvaluateSubmissions = async (req, res) => {
       if (submissionDate > dueDate) {
         const delayMs = submissionDate - dueDate;
         const delayHours = Math.floor(delayMs / (1000 * 60 * 60));
-        
         if (delayHours > 0) {
           marksObtained = Math.max(0, task.maxMarks - delayHours);
           feedback = `Submitted late by ${delayHours} hour(s). Marks reduced accordingly.`;
         }
       }
 
-      // Check if grade already exists to avoid duplicates
-      const gradeExists = await Grade.findOne({ submissionId: submission._id });
-      if (!gradeExists) {
-        // 3. Create Grade
-        await Grade.create({
-          submissionId: submission._id,
-          marksObtained,
-          feedback,
-          reviewedBy: req.user._id
-        });
+      gradesToCreate.push({
+        submissionId: submission._id,
+        marksObtained,
+        feedback,
+        reviewedBy: req.user._id
+      });
 
-        // 4. Update Submission status
-        submission.status = 'graded';
-        await submission.save();
+      let newCoinsAwarded = submission.coinsAwarded || 0;
 
-        // 5. Award Gamification Rewards for Auto-Evaluation
-        try {
-          const User = require('../models/User');
-          const studentUser = await User.findById(submission.studentId);
-          if (studentUser) {
-            const maxMarks = task.maxMarks || 100;
-            const percentage = maxMarks > 0 ? (marksObtained / maxMarks) * 100 : 0;
-            
-            const isProject = task.category === 'Project';
-            let baseXP = 150;
-            let baseCoins = maxMarks * 10;
+      // 3. Award Gamification Rewards in memory (saved once per student)
+      try {
+        const studentUser = submission.studentId ? studentMap.get(submission.studentId.toString()) : null;
+        if (studentUser) {
+          const maxMarks = task.maxMarks || 100;
+          const percentage = maxMarks > 0 ? (marksObtained / maxMarks) * 100 : 0;
 
-            if (isProject) {
-              const titleLower = (task.title || '').toLowerCase();
-              if (titleLower.includes('final') || titleLower.includes('capstone')) {
-                baseXP = 5000;
-                baseCoins = Math.max(2500, maxMarks * 10);
-              } else if (titleLower.includes('large') || maxMarks >= 100) {
-                baseXP = 1500;
-                baseCoins = Math.max(700, maxMarks * 10);
-              } else {
-                baseXP = 500;
-                baseCoins = Math.max(250, maxMarks * 10);
-              }
-            }
+          const isProject = task.category === 'Project';
+          let baseXP = 150;
+          let baseCoins = maxMarks * 10;
 
-            let multiplier = 0.10; // Below 50%
-            if (percentage >= 90) {
-              multiplier = 1.0;
-            } else if (percentage >= 70) {
-              multiplier = 0.70;
-            } else if (percentage >= 50) {
-              multiplier = 0.50;
-            }
-
-            const targetCoins = isProject
-              ? Math.round(baseCoins * multiplier)
-              : Math.round(marksObtained * 10);
-            const alreadyAwarded = submission.coinsAwarded || 0;
-            const coinsReward = Math.max(0, targetCoins - alreadyAwarded);
-            const pointsReward = Math.round(baseXP * multiplier);
-            
-            const { awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges } = require('../utils/gamification');
-            const actualCoins = coinsReward > 0
-              ? awardCoinsWithCap(studentUser, coinsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, true)
-              : 0;
-            const actualXP = awardXPWithCap(studentUser, pointsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, isProject);
-            checkAndAwardBadges(studentUser);
-            
-            await studentUser.save();
-
-            if (actualCoins > 0) {
-              submission.coinsAwarded = alreadyAwarded + actualCoins;
-              await submission.save();
-            }
-
-            if (actualCoins > 0 || (actualXP.actual || 0) > 0) {
-              const GamificationEvent = require('../models/GamificationEvent');
-              await GamificationEvent.create({
-                userId: studentUser._id,
-                eventType: 'coins_earned',
-                coinsChange: actualCoins,
-                xpChange: actualXP.actual || 0,
-                reason: `Auto-Grade: ${percentage.toFixed(0)}% for "${task.title || 'Task'}"`
-              });
+          if (isProject) {
+            const titleLower = (task.title || '').toLowerCase();
+            if (titleLower.includes('final') || titleLower.includes('capstone')) {
+              baseXP = 5000;
+              baseCoins = Math.max(2500, maxMarks * 10);
+            } else if (titleLower.includes('large') || maxMarks >= 100) {
+              baseXP = 1500;
+              baseCoins = Math.max(700, maxMarks * 10);
+            } else {
+              baseXP = 500;
+              baseCoins = Math.max(250, maxMarks * 10);
             }
           }
-        } catch (rewErr) {
-          console.error('Error awarding auto-eval coins:', rewErr);
-        }
 
-        evaluatedCount++;
+          let multiplier = 0.10;
+          if (percentage >= 90) {
+            multiplier = 1.0;
+          } else if (percentage >= 70) {
+            multiplier = 0.70;
+          } else if (percentage >= 50) {
+            multiplier = 0.50;
+          }
+
+          const targetCoins = isProject
+            ? Math.round(baseCoins * multiplier)
+            : Math.round(marksObtained * 10);
+          const alreadyAwarded = submission.coinsAwarded || 0;
+          const coinsReward = Math.max(0, targetCoins - alreadyAwarded);
+          const pointsReward = Math.round(baseXP * multiplier);
+
+          const actualCoins = coinsReward > 0
+            ? awardCoinsWithCap(studentUser, coinsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, true)
+            : 0;
+          const actualXP = awardXPWithCap(studentUser, pointsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, isProject);
+          checkAndAwardBadges(studentUser);
+          touchedStudents.add(studentUser._id.toString());
+
+          if (actualCoins > 0) {
+            newCoinsAwarded = alreadyAwarded + actualCoins;
+          }
+
+          if (actualCoins > 0 || (actualXP.actual || 0) > 0) {
+            gamificationEvents.push({
+              userId: studentUser._id,
+              eventType: 'coins_earned',
+              coinsChange: actualCoins,
+              xpChange: actualXP.actual || 0,
+              reason: `Auto-Grade: ${percentage.toFixed(0)}% for "${task.title || 'Task'}"`
+            });
+          }
+        }
+      } catch (rewErr) {
+        console.error('Error awarding auto-eval coins:', rewErr);
       }
+
+      submissionOps.push({
+        updateOne: {
+          filter: { _id: submission._id },
+          update: { $set: { status: 'graded', coinsAwarded: newCoinsAwarded } }
+        }
+      });
+
+      evaluatedCount++;
     }
 
-    res.status(200).json({ message: `Successfully auto-evaluated ${evaluatedCount} submissions`, count: evaluatedCount });
+    // 4. Persist sector in bulk
+    if (gradesToCreate.length > 0) {
+      await Grade.insertMany(gradesToCreate, { ordered: false });
+    }
+    if (submissionOps.length > 0) {
+      await Submission.bulkWrite(submissionOps);
+    }
+    if (touchedStudents.size > 0) {
+      await Promise.all(
+        [...touchedStudents].map(id => studentMap.get(id)?.save().catch(err => console.error('Error saving student rewards:', err)))
+      );
+    }
+    if (gamificationEvents.length > 0) {
+      await GamificationEvent.insertMany(gamificationEvents, { ordered: false }).catch(() => {});
+    }
+
+    res.status(200).json({
+      message: `Successfully auto-evaluated ${evaluatedCount} submissions`,
+      count: evaluatedCount,
+      sectorSize: pendingSubmissions.length
+    });
 
   } catch (error) {
     console.error('Error in autoEvaluateSubmissions:', error);

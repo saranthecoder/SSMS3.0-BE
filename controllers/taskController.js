@@ -155,7 +155,7 @@ const getTaskById = async (req, res) => {
     const task = await Task.findById(req.params.id).populate('batchId', 'batchName').lean();
 
     if (task) {
-      const isLocked = req.user.role !== 'admin' && task.scheduledAt && new Date(task.scheduledAt) > new Date();
+      const isLocked = req.user.role === 'student' && task.scheduledAt && new Date(task.scheduledAt) > new Date();
       if (isLocked) {
         return res.json({
           _id: task._id,
@@ -188,6 +188,12 @@ const getTaskById = async (req, res) => {
 const updateTask = async (req, res) => {
   try {
     const updateData = { ...req.body };
+    if (typeof updateData.description === 'string') {
+      const strippedDesc = updateData.description.replace(/<[^>]*>/g, '').trim().toLowerCase();
+      if (strippedDesc === 'locked until scheduled release') {
+        delete updateData.description;
+      }
+    }
     if (updateData.dueDate !== undefined) {
       updateData.dueDate = parseToUTC(updateData.dueDate);
     }

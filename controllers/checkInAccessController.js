@@ -703,16 +703,12 @@ const saveDailyWorkload = async (req, res) => {
     });
 
     for (const att of attendances) {
-      if (onsiteAllocated || (att.onsiteDurationSeconds || 0) > 0) {
-        att.onsiteAllocated = true;
-        att.onsiteMinHours = effOnsiteMin;
-        att.onsiteMaxHours = effOnsiteMax;
-      }
-      if (wfhAllocated || (att.wfhDurationSeconds || 0) > 0) {
-        att.wfhAllocated = true;
-        att.wfhMinHours = effWfhMin;
-        att.wfhMaxHours = effWfhMax;
-      }
+      att.onsiteAllocated = Boolean(onsiteAllocated || (att.onsiteDurationSeconds || 0) > 0);
+      att.onsiteMinHours = effOnsiteMin;
+      att.onsiteMaxHours = effOnsiteMax;
+      att.wfhAllocated = Boolean(wfhAllocated || (att.wfhDurationSeconds || 0) > 0);
+      att.wfhMinHours = effWfhMin;
+      att.wfhMaxHours = effWfhMax;
       if (!att.isActive) {
         evaluateAttendanceRecord(att, 0);
       }
