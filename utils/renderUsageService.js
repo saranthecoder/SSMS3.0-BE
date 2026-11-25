@@ -4,7 +4,7 @@ const RenderHostingUsage = require('../models/RenderHostingUsage');
  * Calculates calendar period, reset dates, consumption metrics, and warning levels
  * strictly separating workspace-level pooled free allowance from individual services.
  */
-function calculateUsageMetrics(usageDoc) {
+function calculateUsageMetrics(usageDoc, options = {}) {
   const now = new Date();
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth(); // 0-indexed
@@ -77,6 +77,26 @@ function calculateUsageMetrics(usageDoc) {
   const lastUpdate = usageDoc.lastManualUpdate || usageDoc.updatedAt;
   const isStale = lastUpdate ? (now.getTime() - new Date(lastUpdate).getTime() > 48 * 60 * 60 * 1000) : false;
 
+  // Live cluster burn rate & server capacity guidance (750h/mo shared across concurrent active Render free services)
+  const activeServicesCount = typeof options.activeRenderServicesCount === 'number'
+    ? Math.max(0, options.activeRenderServicesCount)
+    : 0;
+  const estimatedDailyBurnHours = activeServicesCount * 24;
+  const estimatedDaysRemainingAtCurrentRate = estimatedDailyBurnHours > 0
+    ? Number((remainingHours / estimatedDailyBurnHours).toFixed(1))
+    : null;
+  const additionalServerHoursNeeded = daysRemainingInMonth * 24;
+  const canAddNewServerInSameWorkspace = remainingHours > additionalServerHoursNeeded && alertLevel !== 'critical' && alertLevel !== 'high';
+
+  let capacityRecommendation = 'Workspace pool has headroom to add another free server if needed.';
+  if (activeServicesCount > 0 && estimatedDaysRemainingAtCurrentRate !== null && estimatedDaysRemainingAtCurrentRate < daysRemainingInMonth) {
+    capacityRecommendation = `At ${activeServicesCount} active Render service${activeServicesCount > 1 ? 's' : ''} (${estimatedDailyBurnHours}h/day), remaining ${remainingHours}h will run out in ~${estimatedDaysRemainingAtCurrentRate} days (before cycle reset). Add new servers in a separate Render workspace/account or upgrade.`;
+  } else if (alertLevel === 'critical' || alertLevel === 'high') {
+    capacityRecommendation = `Pool usage is ${usagePercent}% (${remainingHours}h left). Avoid adding more free services to this Render workspace; use a new workspace/account if scaling out.`;
+  } else if (activeServicesCount > 0) {
+    capacityRecommendation = `${activeServicesCount} active Render service${activeServicesCount > 1 ? 's' : ''} (~${estimatedDailyBurnHours}h/day). ${remainingHours}h remaining covers the rest of this cycle.`;
+  }
+
   return {
     allowanceHours: allowance,
     consumedHours: consumed,
@@ -115,6 +135,13 @@ function calculateUsageMetrics(usageDoc) {
       lastUpdatedByName: usageDoc.lastUpdatedByName || 'System Initializer',
       dataSource: usageDoc.dataSource || 'manual_entry',
       isStale
+    },
+    clusterCapacity: {
+      activeServicesCount,
+      estimatedDailyBurnHours,
+      estimatedDaysRemainingAtCurrentRate,
+      canAddNewServerInSameWorkspace,
+      capacityRecommendation
     }
   };
 }

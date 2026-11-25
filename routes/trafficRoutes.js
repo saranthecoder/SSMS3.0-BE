@@ -40,15 +40,17 @@ router.get('/public-config', async (req, res) => {
     const STALE_HEALTH_MS = 15 * 60 * 1000; // 15 minutes
     const now = Date.now();
 
+    const reqHost = (req.get('host') || '').toLowerCase();
+
     res.json({
-      policy: config ? config.policy : 'failover',
+      policy: config ? config.policy : 'round-robin',
       cpuThreshold: config ? config.cpuThreshold : 80,
       manualSelectedServerId: config ? config.manualSelectedServerId : null,
       servers: servers.map(s => {
         const isStale = s.lastHealthCheck ? (now - new Date(s.lastHealthCheck).getTime() > STALE_HEALTH_MS) : true;
         const effectiveStatus = isStale ? 'unknown' : s.status;
         const isOnline = effectiveStatus === 'online';
-        const isCurrentInstance = s.url.includes('localhost') || s.isPrimary;
+        const isCurrentInstance = s.url.includes('localhost') || (reqHost && s.url.toLowerCase().includes(reqHost));
         
         const rpm = isOnline && isCurrentInstance ? liveMetrics.appRpm : (s.reqPerMin || 0);
         const appReqs = isOnline && isCurrentInstance ? liveMetrics.appRequests : (s.requestCount || 0);
@@ -261,7 +263,7 @@ router.get('/config', protect, admin, async (req, res) => {
     let config = await TrafficConfig.findOne();
     if (!config) {
       config = await TrafficConfig.create({
-        policy: 'failover',
+        policy: 'round-robin',
         cpuThreshold: 80,
         manualSelectedServerId: null,
         pingIntervalMinutes: 5,
@@ -380,7 +382,8 @@ router.post('/ping', protect, admin, async (req, res) => {
       }
 
       server.lastHealthCheck = new Date();
-      const isCurrentInstance = server.url.includes('localhost') || server.isPrimary;
+      const reqHost = (req.get('host') || '').toLowerCase();
+      const isCurrentInstance = server.url.includes('localhost') || (reqHost && server.url.toLowerCase().includes(reqHost));
 
       if (successfulReqs > 0) {
         const avgResponseTime = Math.round(totalLatency / successfulReqs);
@@ -393,6 +396,8 @@ router.post('/ping', protect, admin, async (req, res) => {
           server.cpuUsage = localMetrics.cpuPercent;
           server.memoryUsage = localMetrics.memoryPercent;
           server.avgProcessingLatencyMs = localMetrics.avgProcessingLatencyMs;
+          if (typeof localMetrics.appRequests === 'number') server.requestCount = localMetrics.appRequests;
+          if (typeof localMetrics.appRpm === 'number') server.reqPerMin = localMetrics.appRpm;
         } else if (latestHealthData && typeof latestHealthData.cpuPercent === 'number') {
           server.cpuUsage = latestHealthData.cpuPercent;
           server.memoryUsage = typeof latestHealthData.memoryPercent === 'number' ? latestHealthData.memoryPercent : null;
@@ -465,6 +470,15 @@ router.post('/ping', protect, admin, async (req, res) => {
   }
 });
 
+async function getActiveRenderServiceCount(serviceResult) {
+  if (serviceResult && Array.isArray(serviceResult.services) && serviceResult.services.length > 0) {
+    return serviceResult.services.filter(s => s.status !== 'suspended' && (s.plan || 'free').toLowerCase() === 'free').length;
+  }
+  const activeNodes = await BackendServer.find({ isActive: true, status: { $ne: 'offline' } }).select('url').lean();
+  const renderNodes = activeNodes.filter(n => (n.url || '').toLowerCase().includes('onrender.com'));
+  return renderNodes.length > 0 ? renderNodes.length : activeNodes.length;
+}
+
 // @route   GET /api/traffic/render-usage
 // @desc    Get Render hosting usage metrics, remaining free hours, warnings, and services
 // @access  Private/Admin
@@ -472,7 +486,8 @@ router.get('/render-usage', protect, admin, async (req, res) => {
   try {
     const doc = await getOrInitUsageDoc();
     const serviceResult = await fetchRenderServicesIfConfigured(doc, false);
-    const metrics = calculateUsageMetrics(doc);
+    const activeRenderServicesCount = await getActiveRenderServiceCount(serviceResult);
+    const metrics = calculateUsageMetrics(doc, { activeRenderServicesCount });
 
     res.json({
       metrics,
@@ -552,7 +567,8 @@ router.post('/render-usage', protect, admin, async (req, res) => {
     await doc.save();
 
     const serviceResult = await fetchRenderServicesIfConfigured(doc, false);
-    const metrics = calculateUsageMetrics(doc);
+    const activeRenderServicesCount = await getActiveRenderServiceCount(serviceResult);
+    const metrics = calculateUsageMetrics(doc, { activeRenderServicesCount });
 
     res.json({
       message: 'Render hosting usage and free limits updated successfully.',
@@ -575,7 +591,8 @@ router.post('/render-usage/refresh', protect, admin, async (req, res) => {
   try {
     const doc = await getOrInitUsageDoc();
     const serviceResult = await fetchRenderServicesIfConfigured(doc, true); // Force refresh
-    const metrics = calculateUsageMetrics(doc);
+    const activeRenderServicesCount = await getActiveRenderServiceCount(serviceResult);
+    const metrics = calculateUsageMetrics(doc, { activeRenderServicesCount });
 
     res.json({
       metrics,
