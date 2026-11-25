@@ -326,6 +326,247 @@ const toggleTaskSubmission = async (req, res) => {
   }
 };
 
+// Helper: RFC-4180 style CSV parser handling quoted commas and newlines
+const parseCSVText = (csvText) => {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < csvText.length; i++) {
+    const ch = csvText[i];
+    const next = csvText[i + 1];
+
+    if (inQuotes) {
+      if (ch === '"' && next === '"') {
+        field += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        field += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ',') {
+        row.push(field.trim());
+        field = '';
+      } else if (ch === '\r' && next === '\n') {
+        row.push(field.trim());
+        if (row.some(c => c !== '')) rows.push(row);
+        row = [];
+        field = '';
+        i++;
+      } else if (ch === '\n' || ch === '\r') {
+        row.push(field.trim());
+        if (row.some(c => c !== '')) rows.push(row);
+        row = [];
+        field = '';
+      } else {
+        field += ch;
+      }
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field.trim());
+    if (row.some(c => c !== '')) rows.push(row);
+  }
+  return rows;
+};
+
+// @desc    Fetch and parse a public/shared Google Sheet CSV for bulk task allocation
+// @route   POST /api/tasks/parse-gsheet
+// @access  Private (Mentor/Admin)
+const parseGoogleSheet = async (req, res) => {
+  try {
+    const { sheetUrl } = req.body;
+    if (!sheetUrl || typeof sheetUrl !== 'string') {
+      return res.status(400).json({ message: 'Google Sheet URL is required.' });
+    }
+
+    const match = sheetUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (!match || !match[1]) {
+      return res.status(400).json({ message: 'Invalid Google Sheet URL. Expected format: https://docs.google.com/spreadsheets/d/<ID>/...' });
+    }
+
+    const sheetId = match[1];
+    const gidMatch = sheetUrl.match(/[?&#]gid=(\d+)/);
+    const gidParam = gidMatch ? `&gid=${gidMatch[1]}` : '';
+    const exportUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv${gidParam}`;
+
+    const response = await fetch(exportUrl, { redirect: 'follow' });
+    if (!response.ok) {
+      return res.status(400).json({
+        message: 'Could not fetch Google Sheet. Make sure link sharing is set to "Anyone with the link can view".'
+      });
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    const text = await response.text();
+    if (contentType.includes('text/html') || text.trim().startsWith('<!DOCTYPE') || text.trim().startsWith('<html')) {
+      return res.status(400).json({
+        message: 'Google Sheet returned a login/HTML page. Please set sharing to "Anyone with the link can view".'
+      });
+    }
+
+    const matrix = parseCSVText(text);
+    if (matrix.length < 2) {
+      return res.status(400).json({ message: 'The Google Sheet appears empty or has no data rows.' });
+    }
+
+    const headers = matrix[0];
+    const rows = matrix.slice(1).map(cols => {
+      const obj = {};
+      headers.forEach((h, idx) => {
+        if (h) obj[h] = cols[idx] !== undefined ? cols[idx] : '';
+      });
+      return obj;
+    });
+
+    res.json({ headers, rows, totalRows: rows.length });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to parse Google Sheet.' });
+  }
+};
+
+// @desc    Bulk create and schedule multiple tasks for a batch
+// @route   POST /api/tasks/bulk
+// @access  Private (Mentor/Admin)
+const bulkCreateTasks = async (req, res) => {
+  try {
+    const { batchId, tasks: taskItems } = req.body;
+    if (!batchId) {
+      return res.status(400).json({ message: 'batchId is required.' });
+    }
+    if (!Array.isArray(taskItems) || taskItems.length === 0) {
+      return res.status(400).json({ message: 'At least one task is required for bulk scheduling.' });
+    }
+    if (taskItems.length > 500) {
+      return res.status(400).json({ message: 'Maximum 500 tasks can be scheduled in a single batch.' });
+    }
+
+    const Batch = require('../models/Batch');
+    const batch = await Batch.findById(batchId).select('mentorId mentors batchName').lean();
+    if (!batch) {
+      return res.status(404).json({ message: 'Batch not found.' });
+    }
+
+    if (req.user.role === 'mentor') {
+      const uid = req.user._id.toString();
+      const isLead = batch.mentorId && batch.mentorId.toString() === uid;
+      const isCo = Array.isArray(batch.mentors) && batch.mentors.some(m => m && m.toString() === uid);
+      if (!isLead && !isCo) {
+        return res.status(403).json({ message: 'Not authorized to allocate tasks to this batch.' });
+      }
+    }
+
+    const validCategories = ['CW', 'HW', 'General', 'Project'];
+    const validTypes = ['text', 'file', 'link'];
+
+    const docs = [];
+    const errors = [];
+
+    taskItems.forEach((item, index) => {
+      const title = (item.title || '').toString().trim().slice(0, 100);
+      if (!title) {
+        errors.push(`Row ${index + 1}: Title is required.`);
+        return;
+      }
+
+      const parsedDue = parseToUTC(item.dueDate);
+      if (!parsedDue || isNaN(parsedDue.getTime())) {
+        errors.push(`Row ${index + 1} ("${title}"): Invalid deadline / dueDate.`);
+        return;
+      }
+
+      const parsedSched = item.scheduledAt ? parseToUTC(item.scheduledAt) : null;
+      if (item.scheduledAt && (!parsedSched || isNaN(parsedSched.getTime()))) {
+        errors.push(`Row ${index + 1} ("${title}"): Invalid scheduledAt date.`);
+        return;
+      }
+
+      const rawCat = (item.category || 'General').toString().trim();
+      const matchedCat = validCategories.find(c => c.toLowerCase() === rawCat.toLowerCase()) || 'General';
+
+      const rawType = (item.taskType || 'text').toString().trim().toLowerCase();
+      const matchedType = validTypes.includes(rawType) ? rawType : (item.linkUrl ? 'link' : 'text');
+
+      let reqLinks = [];
+      if (Array.isArray(item.requiredLinks)) {
+        reqLinks = item.requiredLinks
+          .filter(rl => rl && (rl.label || typeof rl === 'string'))
+          .map(rl => typeof rl === 'string'
+            ? { label: rl.trim(), isMandatory: true }
+            : { label: String(rl.label).trim(), isMandatory: rl.isMandatory !== false }
+          );
+      } else if (typeof item.requiredLinks === 'string' && item.requiredLinks.trim()) {
+        reqLinks = item.requiredLinks
+          .split(/[,;|]/)
+          .map(s => s.trim())
+          .filter(Boolean)
+          .map(label => ({ label, isMandatory: true }));
+      }
+
+      docs.push({
+        title,
+        description: (item.description || '').toString().trim(),
+        taskType: matchedType,
+        category: matchedCat,
+        fileUrl: item.fileUrl || '',
+        linkUrl: item.linkUrl || '',
+        dueDate: parsedDue,
+        maxMarks: Number(item.maxMarks) > 0 ? Number(item.maxMarks) : 100,
+        batchId,
+        createdBy: req.user._id,
+        scheduledAt: parsedSched,
+        requiredLinks: reqLinks
+      });
+    });
+
+    if (errors.length > 0 && docs.length === 0) {
+      return res.status(400).json({ message: errors[0], errors });
+    }
+
+    const createdTasks = await Task.insertMany(docs);
+    invalidateStudentAnalyticsCache();
+
+    // Notify students immediately ONLY for tasks that are already unlocked (not future-scheduled)
+    const now = new Date();
+    const immediateTasks = createdTasks.filter(t => !t.scheduledAt || new Date(t.scheduledAt) <= now);
+    if (immediateTasks.length > 0) {
+      try {
+        const enrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
+        const firstTask = immediateTasks[0];
+        const taskPayload = {
+          taskId: firstTask._id,
+          title: immediateTasks.length > 1 ? `${immediateTasks.length} New Tasks Assigned` : firstTask.title,
+          dueDate: firstTask.dueDate,
+          maxMarks: firstTask.maxMarks,
+          category: firstTask.category,
+          batchId,
+          createdBy: req.user?.name || 'Mentor',
+          createdAt: firstTask.createdAt
+        };
+        socketHandlers.emitToBatch(batchId.toString(), 'new-task-assigned', taskPayload);
+        enrollments.forEach(e => {
+          if (e.studentId) socketHandlers.emitToUser(e.studentId.toString(), 'new-task-assigned', taskPayload);
+        });
+      } catch (sockErr) {}
+    }
+
+    res.status(201).json({
+      success: true,
+      createdCount: createdTasks.length,
+      skippedCount: errors.length,
+      errors,
+      tasks: createdTasks
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
 module.exports = {
   createTask,
   getTasks,
@@ -333,5 +574,7 @@ module.exports = {
   updateTask,
   deleteTask,
   getBatchTrackerData,
-  toggleTaskSubmission
+  toggleTaskSubmission,
+  parseGoogleSheet,
+  bulkCreateTasks
 };

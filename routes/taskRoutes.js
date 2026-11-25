@@ -7,9 +7,14 @@ const {
   updateTask,
   deleteTask,
   getBatchTrackerData,
-  toggleTaskSubmission
+  toggleTaskSubmission,
+  parseGoogleSheet,
+  bulkCreateTasks
 } = require('../controllers/taskController');
 const { protect, admin, mentorOrAdmin } = require('../middleware/authMiddleware');
+
+router.post('/parse-gsheet', protect, mentorOrAdmin, parseGoogleSheet);
+router.post('/bulk', protect, mentorOrAdmin, bulkCreateTasks);
 
 router.route('/tracker/toggle')
   .post(protect, mentorOrAdmin, toggleTaskSubmission);
