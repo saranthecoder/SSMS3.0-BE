@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { calculateUsageMetrics, fetchRenderServicesIfConfigured } = require('./renderUsageService');
+const { calculateUsageMetrics, calculateServerFreeUsage, fetchRenderServicesIfConfigured } = require('./renderUsageService');
 
 test('Render Usage: Calculates remaining hours, percentage, and burn rate correctly', () => {
   const mockDoc = {
@@ -177,4 +177,34 @@ test('Render API Fallback: Gracefully handles missing API key without throwing o
 
   // Restore env
   if (prevKey) process.env.RENDER_API_KEY = prevKey;
+});
+
+test('Per-Server Render Usage: tracks individual 750h quota, accrues live hours, and resets on new month', () => {
+  const now = new Date('2026-11-26T12:00:00.000Z');
+  const syncedServer = {
+    isActive: true,
+    status: 'online',
+    renderMonthlyLimitHours: 750,
+    renderConsumedHours: 100,
+    renderUsageMonth: '2026-11',
+    renderUsageSyncedAt: new Date('2026-11-26T00:00:00.000Z')
+  };
+  const stats = calculateServerFreeUsage(syncedServer, now);
+  assert.equal(stats.consumedHours, 112); // 100 + 12h live accrual
+  assert.equal(stats.remainingHours, 638);
+  assert.equal(stats.isManualSync, true);
+
+  // Prior month sync resets automatically to current month tracking
+  const prevMonthServer = {
+    isActive: true,
+    status: 'online',
+    renderMonthlyLimitHours: 750,
+    renderConsumedHours: 615,
+    renderUsageMonth: '2026-10',
+    renderUsageSyncedAt: new Date('2026-10-30T00:00:00.000Z'),
+    createdAt: new Date('2026-11-26T06:00:00.000Z')
+  };
+  const rolledStats = calculateServerFreeUsage(prevMonthServer, now);
+  assert.equal(rolledStats.consumedHours, 6); // 6h in Nov since createdAt
+  assert.equal(rolledStats.isManualSync, false);
 });

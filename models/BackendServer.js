@@ -57,6 +57,10 @@ const backendServerSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  uptimeSeconds: {
+    type: Number,
+    default: 0
+  },
   activeConnections: {
     type: Number,
     default: 0
@@ -80,6 +84,25 @@ const backendServerSchema = new mongoose.Schema({
   failureReason: {
     type: String,
     default: ''
+  },
+  // Per-server Render free-tier tracking (each server can live in its own Render account/workspace)
+  renderMonthlyLimitHours: {
+    type: Number,
+    default: 750,
+    min: 0
+  },
+  renderConsumedHours: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  renderUsageMonth: {
+    type: String,
+    default: null
+  },
+  renderUsageSyncedAt: {
+    type: Date,
+    default: null
   }
 }, {
   timestamps: true

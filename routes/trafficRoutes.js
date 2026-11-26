@@ -9,6 +9,7 @@ const metricsService = require('../utils/metricsService');
 const RenderHostingUsage = require('../models/RenderHostingUsage');
 const {
   calculateUsageMetrics,
+  calculateServerFreeUsage,
   fetchRenderServicesIfConfigured,
   getOrInitUsageDoc
 } = require('../utils/renderUsageService');
@@ -92,11 +93,12 @@ router.get('/servers', protect, admin, async (req, res) => {
     const liveMetrics = metricsService.getSnapshot();
     const STALE_HEALTH_MS = 15 * 60 * 1000;
     const now = Date.now();
+    const reqHost = (req.get('host') || '').toLowerCase();
 
     const mappedServers = servers.map(s => {
       const isStale = s.lastHealthCheck ? (now - new Date(s.lastHealthCheck).getTime() > STALE_HEALTH_MS) : true;
       const isOnline = s.isActive && s.status === 'online' && !isStale;
-      const isCurrentInstance = s.url.includes('localhost') || s.isPrimary;
+      const isCurrentInstance = s.url.includes('localhost') || (reqHost && s.url.toLowerCase().includes(reqHost));
       
       const appRpm = isOnline && isCurrentInstance ? liveMetrics.appRpm : (s.reqPerMin || 0);
       const appReqs = isOnline && isCurrentInstance ? liveMetrics.appRequests : (s.requestCount || 0);
@@ -104,8 +106,9 @@ router.get('/servers', protect, admin, async (req, res) => {
       const cpu = isOnline && isCurrentInstance ? liveMetrics.cpuPercent : (s.cpuUsage != null ? s.cpuUsage : null);
       const mem = isOnline && isCurrentInstance ? liveMetrics.memoryPercent : (s.memoryUsage != null ? s.memoryUsage : null);
       const processingLatency = isOnline && isCurrentInstance ? liveMetrics.avgProcessingLatencyMs : (s.avgProcessingLatencyMs || 0);
+      const uptimeSec = isOnline && isCurrentInstance ? Math.floor(process.uptime()) : (s.uptimeSeconds || 0);
 
-      return {
+      const serverObj = {
         ...s.toObject(),
         status: s.isActive ? (isStale ? 'unknown' : s.status) : 'offline',
         isStale,
@@ -113,11 +116,14 @@ router.get('/servers', protect, admin, async (req, res) => {
         avgProcessingLatencyMs: processingLatency,   // Server internal latency
         cpuUsage: cpu,
         memoryUsage: mem,
+        uptimeSeconds: uptimeSec,
         requestCount: appReqs,                       // Actual application/student requests
         reqPerMin: appRpm,                           // Real student request frequency
         totalRequests: totalReqs,                    // Total including probes
         probeCount: isOnline && isCurrentInstance ? liveMetrics.probeRequests : 0
       };
+      serverObj.renderUsage = calculateServerFreeUsage(serverObj, new Date(now));
+      return serverObj;
     });
 
     res.json(mappedServers);
@@ -207,6 +213,45 @@ router.put('/servers/:id', protect, admin, async (req, res) => {
     res.json(updatedServer);
   } catch (error) {
     res.status(500).json({ message: 'Error updating server', error: error.message });
+  }
+});
+
+// @route   PUT /api/traffic/servers/:id/render-usage
+// @desc    Update an individual server's monthly free-tier Render usage baseline
+// @access  Private/Admin
+router.put('/servers/:id/render-usage', protect, admin, async (req, res) => {
+  try {
+    const server = await BackendServer.findById(req.params.id);
+    if (!server) {
+      return res.status(404).json({ message: 'Server not found' });
+    }
+    const { consumedHours, monthlyLimitHours } = req.body;
+    const now = new Date();
+    const monthKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+
+    if (monthlyLimitHours !== undefined) {
+      const limitVal = Number(monthlyLimitHours);
+      if (isNaN(limitVal) || limitVal < 0) {
+        return res.status(400).json({ message: 'Monthly limit hours must be a non-negative number.' });
+      }
+      server.renderMonthlyLimitHours = limitVal;
+    }
+    if (consumedHours !== undefined) {
+      const consumedVal = Number(consumedHours);
+      if (isNaN(consumedVal) || consumedVal < 0) {
+        return res.status(400).json({ message: 'Consumed hours must be a non-negative number.' });
+      }
+      server.renderConsumedHours = consumedVal;
+    }
+    server.renderUsageMonth = monthKey;
+    server.renderUsageSyncedAt = now;
+    await server.save();
+
+    const obj = server.toObject();
+    obj.renderUsage = calculateServerFreeUsage(obj, now);
+    res.json(obj);
+  } catch (error) {
+    res.status(500).json({ message: 'Error updating server usage', error: error.message });
   }
 });
 
@@ -404,12 +449,14 @@ async function probeRegisteredServers(reqHost = '') {
         server.cpuUsage = localMetrics.cpuPercent;
         server.memoryUsage = localMetrics.memoryPercent;
         server.avgProcessingLatencyMs = localMetrics.avgProcessingLatencyMs;
+        server.uptimeSeconds = Math.floor(process.uptime());
         if (typeof localMetrics.appRequests === 'number') server.requestCount = localMetrics.appRequests;
         if (typeof localMetrics.appRpm === 'number') server.reqPerMin = localMetrics.appRpm;
       } else if (latestHealthData && typeof latestHealthData.cpuPercent === 'number') {
         server.cpuUsage = latestHealthData.cpuPercent;
         server.memoryUsage = typeof latestHealthData.memoryPercent === 'number' ? latestHealthData.memoryPercent : null;
         server.avgProcessingLatencyMs = typeof latestHealthData.avgProcessingLatencyMs === 'number' ? latestHealthData.avgProcessingLatencyMs : null;
+        if (typeof latestHealthData.uptime === 'number') server.uptimeSeconds = Math.floor(latestHealthData.uptime);
         if (typeof latestHealthData.appRequests === 'number') server.requestCount = latestHealthData.appRequests;
         if (typeof latestHealthData.appRpm === 'number') server.reqPerMin = latestHealthData.appRpm;
       } else {
@@ -485,13 +532,24 @@ router.post('/ping', protect, admin, async (req, res) => {
   }
 });
 
-async function getActiveRenderServiceCount(serviceResult) {
-  if (serviceResult && Array.isArray(serviceResult.services) && serviceResult.services.length > 0) {
-    return serviceResult.services.filter(s => s.status !== 'suspended' && (s.plan || 'free').toLowerCase() === 'free').length;
-  }
-  const activeNodes = await BackendServer.find({ isActive: true, status: { $ne: 'offline' } }).select('url').lean();
+async function getActiveRenderClusterContext(serviceResult) {
+  const activeNodes = await BackendServer.find({ isActive: true, status: { $ne: 'offline' } })
+    .select('name url status uptimeSeconds reqPerMin requestCount createdAt')
+    .lean();
   const renderNodes = activeNodes.filter(n => (n.url || '').toLowerCase().includes('onrender.com'));
-  return renderNodes.length > 0 ? renderNodes.length : activeNodes.length;
+  const targetNodes = renderNodes.length > 0 ? renderNodes : activeNodes;
+
+  if (serviceResult && Array.isArray(serviceResult.services) && serviceResult.services.length > 0) {
+    const apiActiveCount = serviceResult.services.filter(s => s.status !== 'suspended' && (s.plan || 'free').toLowerCase() === 'free').length;
+    return {
+      activeRenderServicesCount: Math.max(apiActiveCount, targetNodes.length),
+      activeRenderServers: targetNodes
+    };
+  }
+  return {
+    activeRenderServicesCount: targetNodes.length,
+    activeRenderServers: targetNodes
+  };
 }
 
 // @route   GET /api/traffic/render-usage
@@ -501,8 +559,8 @@ router.get('/render-usage', protect, admin, async (req, res) => {
   try {
     const doc = await getOrInitUsageDoc();
     const serviceResult = await fetchRenderServicesIfConfigured(doc, false);
-    const activeRenderServicesCount = await getActiveRenderServiceCount(serviceResult);
-    const metrics = calculateUsageMetrics(doc, { activeRenderServicesCount });
+    const clusterCtx = await getActiveRenderClusterContext(serviceResult);
+    const metrics = calculateUsageMetrics(doc, clusterCtx);
 
     res.json({
       metrics,
@@ -582,8 +640,8 @@ router.post('/render-usage', protect, admin, async (req, res) => {
     await doc.save();
 
     const serviceResult = await fetchRenderServicesIfConfigured(doc, false);
-    const activeRenderServicesCount = await getActiveRenderServiceCount(serviceResult);
-    const metrics = calculateUsageMetrics(doc, { activeRenderServicesCount });
+    const clusterCtx = await getActiveRenderClusterContext(serviceResult);
+    const metrics = calculateUsageMetrics(doc, clusterCtx);
 
     res.json({
       message: 'Render hosting usage and free limits updated successfully.',
@@ -606,8 +664,8 @@ router.post('/render-usage/refresh', protect, admin, async (req, res) => {
   try {
     const doc = await getOrInitUsageDoc();
     const serviceResult = await fetchRenderServicesIfConfigured(doc, true); // Force refresh
-    const activeRenderServicesCount = await getActiveRenderServiceCount(serviceResult);
-    const metrics = calculateUsageMetrics(doc, { activeRenderServicesCount });
+    const clusterCtx = await getActiveRenderClusterContext(serviceResult);
+    const metrics = calculateUsageMetrics(doc, clusterCtx);
 
     res.json({
       metrics,

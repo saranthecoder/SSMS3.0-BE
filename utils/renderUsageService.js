@@ -20,8 +20,46 @@ function calculateUsageMetrics(usageDoc, options = {}) {
 
   // Workspace Free Instance Hours
   const allowance = typeof usageDoc.workspaceAllowanceHours === 'number' ? usageDoc.workspaceAllowanceHours : 750;
-  const consumed = typeof usageDoc.consumedHours === 'number' ? usageDoc.consumedHours : 0;
-  const remainingHours = Math.max(0, allowance - consumed);
+  const activeServers = Array.isArray(options.activeRenderServers) ? options.activeRenderServers : null;
+  const activeServicesCount = typeof options.activeRenderServicesCount === 'number'
+    ? Math.max(0, options.activeRenderServicesCount)
+    : (activeServers ? activeServers.length : 0);
+
+  const rawLastUpdate = usageDoc.lastManualUpdate ? new Date(usageDoc.lastManualUpdate) : null;
+  const hasCurrentMonthManualSync = Boolean(
+    usageDoc.dataSource === 'manual_entry' &&
+    rawLastUpdate &&
+    !isNaN(rawLastUpdate.getTime()) &&
+    rawLastUpdate.getTime() >= periodStart.getTime()
+  );
+
+  let consumed = typeof usageDoc.consumedHours === 'number' ? usageDoc.consumedHours : 0;
+  let isEstimatedFromCluster = false;
+
+  if (activeServers && activeServers.length > 0) {
+    if (hasCurrentMonthManualSync) {
+      // Live accrual since the admin's billing sync in this calendar month
+      const hoursSinceSync = Math.max(0, (now.getTime() - rawLastUpdate.getTime()) / (1000 * 60 * 60));
+      consumed = Number((consumed + (activeServicesCount * hoursSinceSync)).toFixed(1));
+    } else {
+      // Auto-calculate real cluster instance-hours accrued this UTC month from active servers
+      let clusterHours = 0;
+      for (const srv of activeServers) {
+        const srvStartMs = srv.createdAt
+          ? Math.max(periodStart.getTime(), new Date(srv.createdAt).getTime())
+          : periodStart.getTime();
+        const trackedHours = Math.max(0, (now.getTime() - srvStartMs) / (1000 * 60 * 60));
+        const uptimeHours = typeof srv.uptimeSeconds === 'number' && srv.uptimeSeconds > 0
+          ? Math.min(trackedHours || (srv.uptimeSeconds / 3600), srv.uptimeSeconds / 3600)
+          : 0;
+        clusterHours += Math.max(trackedHours, uptimeHours);
+      }
+      consumed = Number(clusterHours.toFixed(1));
+      isEstimatedFromCluster = true;
+    }
+  }
+
+  const remainingHours = Number(Math.max(0, allowance - consumed).toFixed(1));
   const usagePercent = allowance > 0 ? Number(((consumed / allowance) * 100).toFixed(1)) : 0;
 
   // Burn rate and projection
@@ -73,14 +111,13 @@ function calculateUsageMetrics(usageDoc, options = {}) {
     alertStatusText = 'Warning — Exceeded 70% of free instance hours';
   }
 
-  // Check staleness of manual or API data (e.g. older than 48h)
+  // Check staleness only for explicit manual entries older than 48h (live cluster estimates are always fresh)
   const lastUpdate = usageDoc.lastManualUpdate || usageDoc.updatedAt;
-  const isStale = lastUpdate ? (now.getTime() - new Date(lastUpdate).getTime() > 48 * 60 * 60 * 1000) : false;
+  const isStale = isEstimatedFromCluster
+    ? false
+    : (lastUpdate ? (now.getTime() - new Date(lastUpdate).getTime() > 48 * 60 * 60 * 1000) : false);
 
   // Live cluster burn rate & server capacity guidance (750h/mo shared across concurrent active Render free services)
-  const activeServicesCount = typeof options.activeRenderServicesCount === 'number'
-    ? Math.max(0, options.activeRenderServicesCount)
-    : 0;
   const estimatedDailyBurnHours = activeServicesCount * 24;
   const estimatedDaysRemainingAtCurrentRate = estimatedDailyBurnHours > 0
     ? Number((remainingHours / estimatedDailyBurnHours).toFixed(1))
@@ -132,8 +169,10 @@ function calculateUsageMetrics(usageDoc, options = {}) {
     },
     audit: {
       lastManualUpdate: usageDoc.lastManualUpdate,
-      lastUpdatedByName: usageDoc.lastUpdatedByName || 'System Initializer',
-      dataSource: usageDoc.dataSource || 'manual_entry',
+      lastUpdatedByName: isEstimatedFromCluster ? 'Live Cluster Tracker' : (usageDoc.lastUpdatedByName || 'Live Cluster Tracker'),
+      dataSource: isEstimatedFromCluster ? 'cluster_live' : (usageDoc.dataSource || 'manual_entry'),
+      isEstimatedFromCluster,
+      hasCurrentMonthManualSync,
       isStale
     },
     clusterCapacity: {
@@ -241,29 +280,104 @@ async function fetchRenderServicesIfConfigured(usageDoc, forceRefresh = false) {
 }
 
 /**
- * Returns existing RenderHostingUsage document or creates initial seed with user's observed state
+ * Returns existing RenderHostingUsage document or creates clean zero-baseline doc,
+ * automatically rolling over expired prior-month manual figures on the 1st of the UTC month.
  */
 async function getOrInitUsageDoc() {
+  const now = new Date();
+  const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+
   let doc = await RenderHostingUsage.findOne();
   if (!doc) {
     doc = await RenderHostingUsage.create({
       workspaceAllowanceHours: 750,
-      consumedHours: 615, // Initialized with user's reported state (615/750 consumed)
+      consumedHours: 0,
       bandwidthLimitGB: 100,
-      bandwidthConsumedGB: 14.2,
+      bandwidthConsumedGB: 0,
       buildMinutesLimit: 500,
-      buildMinutesConsumed: 68,
+      buildMinutesConsumed: 0,
       warningThresholds: [70, 85, 95],
-      lastManualUpdate: new Date(),
-      lastUpdatedByName: 'Render Initial Seed',
+      lastManualUpdate: null,
+      lastUpdatedByName: 'Live Cluster Tracker',
       dataSource: 'manual_entry'
     });
+  } else if (doc.lastManualUpdate && new Date(doc.lastManualUpdate).getTime() < periodStart.getTime()) {
+    // Auto-reset expired figures from a previous billing month so stale numbers never bleed forward
+    doc.consumedHours = 0;
+    doc.bandwidthConsumedGB = 0;
+    doc.buildMinutesConsumed = 0;
+    doc.lastManualUpdate = null;
+    doc.lastUpdatedByName = 'Monthly Auto-Reset';
+    await doc.save();
   }
   return doc;
 }
 
+/**
+ * Computes individual Render free-tier usage (750h/mo default) for a single registered server.
+ * Automatically resets at 1st of each UTC month and accrues live hours while active/online.
+ */
+function calculateServerFreeUsage(server, now = new Date()) {
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  const monthKey = `${year}-${String(month + 1).padStart(2, '0')}`;
+  const periodStart = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+  const nextReset = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0, 0));
+  const daysRemainingInMonth = Math.max(0, new Date(Date.UTC(year, month + 1, 0)).getUTCDate() - now.getUTCDate());
+
+  const limitHours = typeof server?.renderMonthlyLimitHours === 'number' && server.renderMonthlyLimitHours > 0
+    ? server.renderMonthlyLimitHours
+    : 750;
+
+  const isSameMonthSync = Boolean(
+    server?.renderUsageMonth === monthKey &&
+    server?.renderUsageSyncedAt &&
+    !isNaN(new Date(server.renderUsageSyncedAt).getTime())
+  );
+
+  let consumedHours = 0;
+  let isManualSync = false;
+  if (isSameMonthSync) {
+    isManualSync = true;
+    const baseConsumed = Number(server.renderConsumedHours || 0);
+    const syncedAtMs = new Date(server.renderUsageSyncedAt).getTime();
+    const isRunning = server.isActive !== false && server.status !== 'offline';
+    const extraHours = isRunning ? Math.max(0, (now.getTime() - syncedAtMs) / (1000 * 60 * 60)) : 0;
+    consumedHours = Number((baseConsumed + extraHours).toFixed(1));
+  } else {
+    const startMs = server?.createdAt
+      ? Math.max(periodStart.getTime(), new Date(server.createdAt).getTime())
+      : periodStart.getTime();
+    const trackedHours = Math.max(0, (now.getTime() - startMs) / (1000 * 60 * 60));
+    const uptimeHours = typeof server?.uptimeSeconds === 'number' && server.uptimeSeconds > 0
+      ? Math.min(trackedHours || (server.uptimeSeconds / 3600), server.uptimeSeconds / 3600)
+      : 0;
+    consumedHours = Number(Math.max(trackedHours, uptimeHours).toFixed(1));
+  }
+
+  const remainingHours = Number(Math.max(0, limitHours - consumedHours).toFixed(1));
+  const percent = limitHours > 0 ? Number(((consumedHours / limitHours) * 100).toFixed(1)) : 0;
+  const daysLeftAt24h = Number((remainingHours / 24).toFixed(1));
+  const alertLevel = percent >= 90 ? 'critical' : percent >= 70 ? 'warning' : 'normal';
+
+  return {
+    limitHours,
+    consumedHours,
+    remainingHours,
+    percent,
+    daysLeftAt24h,
+    alertLevel,
+    monthKey,
+    nextReset: nextReset.toISOString(),
+    daysRemainingInMonth,
+    isManualSync,
+    lastSyncedAt: isSameMonthSync ? server.renderUsageSyncedAt : null
+  };
+}
+
 module.exports = {
   calculateUsageMetrics,
+  calculateServerFreeUsage,
   fetchRenderServicesIfConfigured,
   getOrInitUsageDoc
 };

@@ -410,15 +410,15 @@ if (typeof trafficRoutes.probeRegisteredServers === 'function') {
     }
   })();
   setTimeout(() => {
-    runDistributedJob('cluster_health_probe', 45000, 240000, async () => {
+    runDistributedJob('cluster_health_probe', 45000, 150000, async () => {
       await trafficRoutes.probeRegisteredServers(selfHost);
     });
   }, 3000);
   setInterval(async () => {
-    await runDistributedJob('cluster_health_probe', 45000, 240000, async () => {
+    await runDistributedJob('cluster_health_probe', 45000, 150000, async () => {
       await trafficRoutes.probeRegisteredServers(selfHost);
     });
-  }, 5 * 60 * 1000);
+  }, 3 * 60 * 1000);
 }
 
 // Auto-Checkout & Batch Lifecycle Routine: Runs every 60 seconds with distributed lock coordination across instances
