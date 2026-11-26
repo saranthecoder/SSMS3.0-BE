@@ -184,6 +184,12 @@ const verifyMonitorPin = async (req, res) => {
       });
     }
 
+    // Start warming monitor dashboard cache immediately before the client fetches /api/public/monitor
+    try {
+      const { prewarmMonitorDashboard } = require('./publicController');
+      prewarmMonitorDashboard(access.pin);
+    } catch (_) {}
+
     res.json({
       valid: true,
       panelName: access.panelName,

@@ -1,8 +1,9 @@
 const Submission = require('../models/Submission');
+const Grade = require('../models/Grade');
 const Task = require('../models/Task');
 const User = require('../models/User');
 const GamificationEvent = require('../models/GamificationEvent');
-const { awardCoinsWithCap, checkAndAwardBadges } = require('../utils/gamification');
+const { awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges } = require('../utils/gamification');
 const socketHandlers = require('../sockets/socketHandlers');
 const { invalidateStudentAnalyticsCache } = require('./analyticsController');
 
@@ -39,23 +40,30 @@ const submitTask = async (req, res) => {
       }
     }
 
-    // Calculate 10x allocated marks for gamification coins
+    // Calculate 10x coins & 15x XP per effective mark after deducting late penalty (1 mark per hour delay)
     const taskMarks = (task.maxMarks !== undefined && Number(task.maxMarks) > 0) ? Number(task.maxMarks) : 10;
-    const coinsToAward = Math.round(taskMarks * 10);
+    const effectiveMarks = Math.max(0, taskMarks - latePenalty);
+    const coinsToAward = Math.round(effectiveMarks * 10);
+    const xpToAward = Math.round(effectiveMarks * 15);
+    const coinReason = latePenalty > 0
+      ? `Task Submission: "${task.title}" (${effectiveMarks}/${taskMarks} marks after -${latePenalty} late penalty)`
+      : `Task Submission: "${task.title}" (${taskMarks} marks)`;
 
     if (submissionExists) {
       if (submissionExists.status === 'resubmit') {
         let coinsGivenOnResubmit = 0;
-        // If not previously awarded coins for this task, award now
-        if (!submissionExists.coinsAwarded && coinsToAward > 0) {
+        let xpGivenOnResubmit = 0;
+        // If not previously awarded rewards for this task, award now
+        if (!submissionExists.coinsAwarded && !submissionExists.xpAwarded && (coinsToAward > 0 || xpToAward > 0)) {
           const studentUser = await User.findById(req.user._id);
           if (studentUser) {
-            coinsGivenOnResubmit = awardCoinsWithCap(
-              studentUser,
-              coinsToAward,
-              `Task Submission: "${task.title}" (10x ${taskMarks} marks)`,
-              true
-            );
+            if (coinsToAward > 0) {
+              coinsGivenOnResubmit = awardCoinsWithCap(studentUser, coinsToAward, coinReason, true);
+            }
+            if (xpToAward > 0) {
+              const xpRes = awardXPWithCap(studentUser, xpToAward, coinReason, true);
+              xpGivenOnResubmit = xpRes.actual || 0;
+            }
             checkAndAwardBadges(studentUser);
             await studentUser.save();
 
@@ -63,23 +71,27 @@ const submitTask = async (req, res) => {
               userId: studentUser._id,
               eventType: 'coins_earned',
               coinsChange: coinsGivenOnResubmit,
-              xpChange: 0,
-              reason: `Task Submission: "${task.title}" (10x ${taskMarks} marks)`,
-              metadata: { taskId: task._id, taskTitle: task.title, maxMarks: taskMarks, coinsAwarded: coinsGivenOnResubmit }
+              xpChange: xpGivenOnResubmit,
+              reason: coinReason,
+              metadata: { taskId: task._id, taskTitle: task.title, maxMarks: taskMarks, effectiveMarks, latePenalty, coinsAwarded: coinsGivenOnResubmit, xpAwarded: xpGivenOnResubmit }
             });
 
             try {
               socketHandlers.emitToUser(studentUser._id.toString(), 'coins-received', {
                 sender: { name: 'SSMS Tasks' },
                 amount: coinsGivenOnResubmit,
+                xpAmount: xpGivenOnResubmit,
                 newCoins: studentUser.coins,
-                reason: `Earned ${coinsGivenOnResubmit} gamification coins for submitting "${task.title}"!`
+                reason: latePenalty > 0
+                  ? `Earned +${coinsGivenOnResubmit} coins & +${xpGivenOnResubmit} XP for submitting "${task.title}" late (-${latePenalty} mark penalty).`
+                  : `Earned +${coinsGivenOnResubmit} coins & +${xpGivenOnResubmit} XP for submitting "${task.title}"!`
               });
             } catch (sockErr) {
               console.warn('Real-time coins-received socket warning:', sockErr.message);
             }
           }
           submissionExists.coinsAwarded = coinsGivenOnResubmit;
+          submissionExists.xpAwarded = xpGivenOnResubmit;
         }
 
         // Update existing submission
@@ -102,6 +114,9 @@ const submitTask = async (req, res) => {
         return res.status(200).json({
           ...submissionExists.toObject(),
           coinsAwarded: coinsGivenOnResubmit || submissionExists.coinsAwarded || 0,
+          xpAwarded: xpGivenOnResubmit || submissionExists.xpAwarded || 0,
+          effectiveMarks,
+          latePenalty,
           taskMarks
         });
       } else {
@@ -109,17 +124,19 @@ const submitTask = async (req, res) => {
       }
     }
 
-    // Award 10x marks into student's gamification coins
+    // Award 10x coins & 15x XP per effective mark into student's gamification balance
     let actualCoinsAwarded = 0;
-    if (coinsToAward > 0) {
+    let actualXpAwarded = 0;
+    if (coinsToAward > 0 || xpToAward > 0) {
       const studentUser = await User.findById(req.user._id);
       if (studentUser) {
-        actualCoinsAwarded = awardCoinsWithCap(
-          studentUser,
-          coinsToAward,
-          `Task Submission: "${task.title}" (10x ${taskMarks} marks)`,
-          true
-        );
+        if (coinsToAward > 0) {
+          actualCoinsAwarded = awardCoinsWithCap(studentUser, coinsToAward, coinReason, true);
+        }
+        if (xpToAward > 0) {
+          const xpRes = awardXPWithCap(studentUser, xpToAward, coinReason, true);
+          actualXpAwarded = xpRes.actual || 0;
+        }
         checkAndAwardBadges(studentUser);
         await studentUser.save();
 
@@ -127,13 +144,16 @@ const submitTask = async (req, res) => {
           userId: studentUser._id,
           eventType: 'coins_earned',
           coinsChange: actualCoinsAwarded,
-          xpChange: 0,
-          reason: `Task Submission: "${task.title}" (10x ${taskMarks} marks)`,
+          xpChange: actualXpAwarded,
+          reason: coinReason,
           metadata: {
             taskId: task._id,
             taskTitle: task.title,
             maxMarks: taskMarks,
-            coinsAwarded: actualCoinsAwarded
+            effectiveMarks,
+            latePenalty,
+            coinsAwarded: actualCoinsAwarded,
+            xpAwarded: actualXpAwarded
           }
         });
 
@@ -142,8 +162,11 @@ const submitTask = async (req, res) => {
           socketHandlers.emitToUser(studentUser._id.toString(), 'coins-received', {
             sender: { name: 'SSMS Tasks' },
             amount: actualCoinsAwarded,
+            xpAmount: actualXpAwarded,
             newCoins: studentUser.coins,
-            reason: `Earned ${actualCoinsAwarded} gamification coins for submitting "${task.title}"!`
+            reason: latePenalty > 0
+              ? `Earned +${actualCoinsAwarded} coins & +${actualXpAwarded} XP for submitting "${task.title}" late (-${latePenalty} mark penalty).`
+              : `Earned +${actualCoinsAwarded} coins & +${actualXpAwarded} XP for submitting "${task.title}"!`
           });
         } catch (sockErr) {
           console.warn('Real-time coins-received socket warning:', sockErr.message);
@@ -166,7 +189,8 @@ const submitTask = async (req, res) => {
       delayHours,
       latePenalty,
       submittedLinks: submittedLinks || [],
-      coinsAwarded: actualCoinsAwarded
+      coinsAwarded: actualCoinsAwarded,
+      xpAwarded: actualXpAwarded
     });
 
     invalidateStudentAnalyticsCache(req.user._id);
@@ -174,6 +198,9 @@ const submitTask = async (req, res) => {
     res.status(201).json({
       ...submission.toObject(),
       coinsAwarded: actualCoinsAwarded,
+      xpAwarded: actualXpAwarded,
+      effectiveMarks,
+      latePenalty,
       taskMarks
     });
   } catch (error) {
@@ -250,7 +277,7 @@ const getSubmissions = async (req, res) => {
 const getSubmissionById = async (req, res) => {
   try {
     const submission = await Submission.findById(req.params.id)
-      .populate('taskId', 'title maxMarks')
+      .populate('taskId', 'title maxMarks dueDate category')
       .populate('studentId', 'name email');
 
     if (submission) {
@@ -258,7 +285,13 @@ const getSubmissionById = async (req, res) => {
       if (req.user.role === 'student' && submission.studentId._id.toString() !== req.user._id.toString()) {
         return res.status(403).json({ message: 'Not authorized to view this submission' });
       }
-      res.json(submission);
+      const grade = await Grade.findOne({ submissionId: submission._id })
+        .populate('reviewedBy', 'name')
+        .lean();
+      res.json({
+        ...submission.toObject(),
+        grade: grade || null
+      });
     } else {
       res.status(404).json({ message: 'Submission not found' });
     }

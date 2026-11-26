@@ -125,27 +125,26 @@ const verifyStudent = async (req, res) => {
   }
 };
 
-// In-memory cache for monitor dashboard stats by PIN/Scope
+// In-memory cache & in-flight deduplication for monitor dashboard stats by PIN/Scope
 const monitorCacheMap = new Map();
-const MONITOR_CACHE_TTL_MS = 5000; // 5 seconds maximum cache for live feel
+const inFlightMonitorMap = new Map();
+const MONITOR_CACHE_TTL_MS = 15000; // 15 seconds fresh cache for near-realtime updates
+const MONITOR_STALE_TTL_MS = 1800000; // 30 minutes stale-while-revalidate window
 
-// @desc    Get complete monitoring dashboard data
-// @route   GET /api/public/monitor
-// @access  Public (Requires Frontend Passcode / PIN)
-const getMonitorDashboardData = async (req, res) => {
-  try {
-    const now = Date.now();
-    const isFreshRequested = req.query.fresh === 'true';
-    const pin = (req.query.pin || req.headers['x-monitor-pin'] || '').trim().toUpperCase();
-    const cacheKey = pin || 'global';
+const getISTDateStr = (date = new Date()) => {
+  const istTime = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const year = istTime.getFullYear();
+  const month = String(istTime.getMonth() + 1).padStart(2, '0');
+  const day = String(istTime.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
 
-    if (!isFreshRequested && monitorCacheMap.has(cacheKey)) {
-      const entry = monitorCacheMap.get(cacheKey);
-      if (entry && (now - entry.timestamp) < MONITOR_CACHE_TTL_MS) {
-        return res.status(200).json(entry.payload);
-      }
-    }
+const buildMonitorPayload = async (pin, cacheKey) => {
+  if (inFlightMonitorMap.has(cacheKey)) {
+    return inFlightMonitorMap.get(cacheKey);
+  }
 
+  const buildPromise = (async () => {
     // Resolve PIN permissions & custom college panel name
     let panelName = 'Monitoring Center';
     let isGlobal = true;
@@ -192,9 +191,31 @@ const getMonitorDashboardData = async (req, res) => {
           ]
         }
       : {};
+    const submissionMatchAgg = isRestrictedScope
+      ? [{
+          $match: {
+            $or: [
+              { taskId: { $in: scopedTaskIds } },
+              ...(scopedBatchStudentIds.length > 0
+                ? [{ studentId: { $in: scopedBatchStudentIds.map(id => new mongoose.Types.ObjectId(id)) } }]
+                : [])
+            ]
+          }
+        }]
+      : [];
     const taskAggMatch = isRestrictedScope ? [{ $match: { taskId: { $in: scopedTaskIds } } }] : [];
 
-    // Phase 1: Fetch all data except grades in parallel
+    // Phase 1: Fetch raw collections & full-DB aggregations in parallel WITHOUT duplicate Mongoose .populate() round-trips
+    const todayDateStr = getISTDateStr();
+    const leetcodeAggPipeline = isRestrictedScope
+      ? [
+          ...(scopedBatchStudentIds.length > 0
+            ? [{ $match: { studentId: { $in: scopedBatchStudentIds.map(id => new mongoose.Types.ObjectId(id)) } } }]
+            : [{ $match: { _id: null } }]),
+          { $group: { _id: '$problemId', count: { $sum: 1 } } }
+        ]
+      : [{ $group: { _id: '$problemId', count: { $sum: 1 } } }];
+
     const [
       students,
       activeAttendances,
@@ -202,38 +223,40 @@ const getMonitorDashboardData = async (req, res) => {
       allTasks,
       taskStatsAgg,
       subStatusAgg,
+      studentSubAgg,
       attendanceAggregates,
       todayAttendance,
       batches,
       leetcodeProblems,
-      leetcodeSubmissions,
+      leetcodeSubCountsAgg,
       allMockDriveScores,
       allEnrollments,
       allLeaves,
       allAccessLogs,
       allSyllabus
     ] = await Promise.all([
-      User.find({ role: 'student' }).select('-password -__v').lean(),
+      User.find({ role: 'student' })
+        .select('name email rollNumber phone profileImage batchId batch github linkedin portfolio leetcode hackerrank leetcodeStreak maxLeetcodeStreak totalLeetcodeSubmissions isRestricted isBlocked isSuspended suspendedUntil blockReason coins level xp points league createdAt')
+        .lean(),
       
       Attendance.find({ isActive: true })
-        .populate('studentId', 'name rollNumber profileImage batchId')
+        .select('studentId batchId checkInTime lastCheckInTime sessionDurationSeconds isActive dateStr mode locationType')
         .lean(),
 
-      // All submissions with student + task data (scoped to batch or latest 1500 for global)
+      // Recent submissions for UI tables/timeline (exact totals come from aggregations below)
       Submission.find(submissionQuery)
         .sort({ submittedAt: -1 })
-        .limit(isRestrictedScope ? 5000 : 1500)
-        .populate('studentId', 'name rollNumber profileImage email batchId')
-        .populate('taskId', 'title category maxMarks dueDate batchId')
+        .limit(isRestrictedScope ? 1000 : 300)
+        .select('taskId studentId status submittedAt createdAt submissionType githubLink liveLink isLate delayHours latePenalty coinsAwarded xpAwarded')
         .lean(),
 
-      // Tasks (scoped to batch if restricted)
+      // Tasks without large HTML description bodies
       Task.find(taskQuery)
         .sort({ createdAt: -1 })
-        .populate('batchId', 'batchName')
+        .select('title category maxMarks dueDate batchId scheduledAt createdAt taskType')
         .lean(),
 
-      // Exact submission counts and graded counts aggregated per task
+      // Exact submission counts by status aggregated per task across ALL submissions
       Submission.aggregate([
         ...taskAggMatch,
         {
@@ -242,12 +265,18 @@ const getMonitorDashboardData = async (req, res) => {
             submissionCount: { $sum: 1 },
             gradedCount: {
               $sum: { $cond: [{ $eq: ["$status", "graded"] }, 1, 0] }
+            },
+            pendingCount: {
+              $sum: { $cond: [{ $in: ["$status", ["submitted", "pending"]] }, 1, 0] }
+            },
+            resubmitCount: {
+              $sum: { $cond: [{ $eq: ["$status", "resubmit"] }, 1, 0] }
             }
           }
         }
       ]),
 
-      // Exact submission status summary counts
+      // Exact submission status summary counts across ALL submissions
       Submission.aggregate([
         ...taskAggMatch,
         {
@@ -258,41 +287,112 @@ const getMonitorDashboardData = async (req, res) => {
         }
       ]),
 
-      // Attendance aggregation per student
+      // Full-DB per-student submission & grade statistics across ALL submissions (not capped to 300/1000)
+      Submission.aggregate([
+        ...submissionMatchAgg,
+        {
+          $lookup: {
+            from: "grades",
+            localField: "_id",
+            foreignField: "submissionId",
+            as: "gradeDoc"
+          }
+        },
+        {
+          $lookup: {
+            from: "tasks",
+            localField: "taskId",
+            foreignField: "_id",
+            as: "taskDoc"
+          }
+        },
+        {
+          $project: {
+            studentId: 1,
+            status: 1,
+            marksObtained: { $arrayElemAt: ["$gradeDoc.marksObtained", 0] },
+            maxMarks: { $arrayElemAt: ["$taskDoc.maxMarks", 0] }
+          }
+        },
+        {
+          $group: {
+            _id: "$studentId",
+            totalSubmissions: { $sum: 1 },
+            pendingCount: {
+              $sum: { $cond: [{ $in: ["$status", ["submitted", "pending"]] }, 1, 0] }
+            },
+            gradedCount: {
+              $sum: { $cond: [{ $eq: ["$status", "graded"] }, 1, 0] }
+            },
+            resubmitCount: {
+              $sum: { $cond: [{ $eq: ["$status", "resubmit"] }, 1, 0] }
+            },
+            totalTaskScore: { $sum: { $ifNull: ["$marksObtained", 0] } },
+            pctSum: {
+              $sum: {
+                $cond: [
+                  { $and: [{ $eq: ["$status", "graded"] }, { $ne: ["$marksObtained", null] }, { $gt: ["$maxMarks", 0] }] },
+                  { $multiply: [{ $divide: ["$marksObtained", "$maxMarks"] }, 100] },
+                  0
+                ]
+              }
+            },
+            pctCount: {
+              $sum: {
+                $cond: [
+                  { $and: [{ $eq: ["$status", "graded"] }, { $ne: ["$marksObtained", null] }, { $gt: ["$maxMarks", 0] }] },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
+        }
+      ]),
+
+      // Accurate attendance aggregation per student (only Present/active sessions count as daysPresent)
       Attendance.aggregate([
         {
           $group: {
             _id: "$studentId",
             totalSeconds: { $sum: { $ifNull: ["$sessionDurationSeconds", 0] } },
-            daysPresent: { $addToSet: "$dateStr" }
+            daysPresent: {
+              $addToSet: {
+                $cond: [
+                  { $or: [{ $eq: ["$status", "Present"] }, { $eq: ["$isActive", true] }] },
+                  "$dateStr",
+                  "$$REMOVE"
+                ]
+              }
+            }
           }
         }
       ]),
 
       // Today's attendance logs for activity timeline
-      Attendance.find({ dateStr: new Date().toISOString().split('T')[0] })
-        .populate('studentId', 'name rollNumber')
+      Attendance.find({ dateStr: todayDateStr })
+        .select('studentId checkInTime checkOutTime')
         .sort({ checkInTime: -1 })
         .lean(),
 
       Batch.find().populate('mentorId', 'name email profileImage phone').lean(),
 
-      Leetcode.find().populate('batchId', 'batchName').lean(),
+      Leetcode.find()
+        .select('title problemLink deadline difficulty batchId scheduledAt createdAt')
+        .lean(),
 
-      LeetcodeSubmission.find().populate('studentId', 'name rollNumber').lean(),
+      // Aggregated submission counts per LeetCode problem instead of transferring 3000+ raw rows
+      LeetcodeSubmission.aggregate(leetcodeAggPipeline),
 
       MockDriveScore.find()
         .populate('mockDriveId', 'title maxMarks date')
-        .populate('studentId', 'name rollNumber batchId')
         .lean(),
 
       Enrollment.find()
-        .populate('studentId', 'name email rollNumber')
-        .populate('batchId', 'batchName')
+        .select('studentId batchId status createdAt')
         .lean(),
 
       Leave.find()
-        .populate('studentId', 'name email rollNumber batch')
         .sort({ createdAt: -1 })
         .lean(),
 
@@ -302,18 +402,80 @@ const getMonitorDashboardData = async (req, res) => {
         .lean(),
 
       SyllabusTrack.find()
-        .populate('batchId', 'batchName courseName')
         .populate('mentorId', 'name email')
         .sort({ date: -1, createdAt: -1 })
         .limit(250)
         .lean()
     ]);
 
-    // Phase 2: Query grades ONLY for the loaded 500 submissions using indexed unique field submissionId
+    // Build fast O(1) lookup maps in memory to replace 10+ redundant Atlas populate queries
+    const studentMiniMap = new Map();
+    students.forEach(st => {
+      studentMiniMap.set(st._id.toString(), {
+        _id: st._id,
+        name: st.name,
+        email: st.email,
+        rollNumber: st.rollNumber,
+        profileImage: st.profileImage,
+        batchId: st.batchId || null,
+        batch: st.batch || null
+      });
+    });
+
+    const batchMiniMap = new Map();
+    batches.forEach(b => {
+      batchMiniMap.set(b._id.toString(), {
+        _id: b._id,
+        batchName: b.batchName,
+        courseName: b.courseName
+      });
+    });
+
+    const taskMiniMap = new Map();
+    allTasks.forEach(t => {
+      taskMiniMap.set(t._id.toString(), {
+        _id: t._id,
+        title: t.title,
+        category: t.category,
+        maxMarks: t.maxMarks,
+        dueDate: t.dueDate,
+        batchId: t.batchId
+      });
+    });
+
+    const leetcodeSubCountMap = new Map();
+    (leetcodeSubCountsAgg || []).forEach(item => {
+      if (item._id) {
+        leetcodeSubCountMap.set(item._id.toString(), item.count || 0);
+      }
+    });
+
+    const hydrateStudent = (idVal) => {
+      if (!idVal) return null;
+      const key = (idVal._id || idVal).toString();
+      return studentMiniMap.get(key) || (typeof idVal === 'object' ? idVal : { _id: idVal });
+    };
+
+    const hydrateBatch = (idVal) => {
+      if (!idVal) return null;
+      const key = (idVal._id || idVal).toString();
+      return batchMiniMap.get(key) || (typeof idVal === 'object' ? idVal : { _id: idVal });
+    };
+
+    const hydrateTask = (idVal) => {
+      if (!idVal) return null;
+      const key = (idVal._id || idVal).toString();
+      return taskMiniMap.get(key) || (typeof idVal === 'object' ? idVal : { _id: idVal });
+    };
+
+    // Phase 2: Query grades ONLY for the loaded submissions using indexed unique field submissionId
     const subIds = allSubmissions.map(s => s._id);
-    const allGrades = await Grade.find({ submissionId: { $in: subIds } })
-      .populate('reviewedBy', 'name')
-      .lean();
+    const allGrades = subIds.length > 0
+      ? await Grade.find({ submissionId: { $in: subIds } })
+          .select('submissionId marksObtained rawMarks latePenalty feedback reviewedBy reviewedAt')
+          .populate('reviewedBy', 'name')
+          .lean()
+      : [];
 
     // Build attendance map
     const attendanceMap = {};
@@ -369,7 +531,8 @@ const getMonitorDashboardData = async (req, res) => {
     const effectiveSubmissions = isRestrictedScope
       ? allSubmissions.filter(sub => {
           const sId = (sub.studentId?._id || sub.studentId)?.toString();
-          const bId = (sub.taskId?.batchId?._id || sub.taskId?.batchId)?.toString();
+          const hydratedTask = hydrateTask(sub.taskId);
+          const bId = (hydratedTask?.batchId?._id || hydratedTask?.batchId)?.toString();
           return (sId && scopedStudentIdSet.has(sId)) || (bId && allowedBatchSet.has(bId));
         })
       : allSubmissions;
@@ -380,7 +543,9 @@ const getMonitorDashboardData = async (req, res) => {
       if (stat._id) {
         taskStatsMap[stat._id.toString()] = {
           submissionCount: stat.submissionCount || 0,
-          gradedCount: stat.gradedCount || 0
+          gradedCount: stat.gradedCount || 0,
+          pendingCount: stat.pendingCount || 0,
+          resubmitCount: stat.resubmitCount || 0
         };
       }
     });
@@ -390,31 +555,38 @@ const getMonitorDashboardData = async (req, res) => {
       : allTasks
     ).map(task => {
       const tId = task._id?.toString();
-      const stats = taskStatsMap[tId] || { submissionCount: 0, gradedCount: 0 };
+      const stats = taskStatsMap[tId] || { submissionCount: 0, gradedCount: 0, pendingCount: 0, resubmitCount: 0 };
       return {
         ...task,
+        batchId: hydrateBatch(task.batchId),
         submissionCount: stats.submissionCount,
-        gradedCount: stats.gradedCount
+        gradedCount: stats.gradedCount,
+        pendingCount: stats.pendingCount,
+        resubmitCount: stats.resubmitCount
       };
     });
 
-    const effectiveTodayAttendance = isRestrictedScope
+    const effectiveTodayAttendance = (isRestrictedScope
       ? todayAttendance.filter(a => {
           const sId = (a.studentId?._id || a.studentId)?.toString();
           return sId && scopedStudentIdSet.has(sId);
         })
-      : todayAttendance;
+      : todayAttendance
+    ).map(a => ({
+      ...a,
+      studentId: hydrateStudent(a.studentId)
+    }));
 
-    const effectiveLeetcodeProblems = isRestrictedScope
+    const effectiveLeetcodeProblems = (isRestrictedScope
       ? leetcodeProblems.filter(lp => !lp.batchId || allowedBatchSet.has((lp.batchId._id || lp.batchId).toString()))
-      : leetcodeProblems;
+      : leetcodeProblems
+    ).map(lp => ({
+      ...lp,
+      batchId: hydrateBatch(lp.batchId),
+      submissionCount: leetcodeSubCountMap.get(lp._id.toString()) || 0
+    }));
 
-    const effectiveLeetcodeSubmissions = isRestrictedScope
-      ? leetcodeSubmissions.filter(ls => {
-          const sId = (ls.studentId?._id || ls.studentId)?.toString();
-          return sId && scopedStudentIdSet.has(sId);
-        })
-      : leetcodeSubmissions;
+    const effectiveLeetcodeSubmissions = [];
 
     const effectiveMockDriveScores = isRestrictedScope
       ? allMockDriveScores.filter(m => {
@@ -423,9 +595,14 @@ const getMonitorDashboardData = async (req, res) => {
         })
       : allMockDriveScores;
 
-    const effectiveEnrollments = isRestrictedScope
+    const effectiveEnrollments = (isRestrictedScope
       ? allEnrollments.filter(e => allowedBatchSet.has((e.batchId?._id || e.batchId)?.toString()))
-      : allEnrollments;
+      : allEnrollments
+    ).map(e => ({
+      ...e,
+      studentId: hydrateStudent(e.studentId),
+      batchId: hydrateBatch(e.batchId)
+    }));
 
     const effectiveLeaves = isRestrictedScope
       ? allLeaves.filter(l => {
@@ -442,16 +619,18 @@ const getMonitorDashboardData = async (req, res) => {
         })
       : allAccessLogs;
 
-    // Enrich submissions with student batch and grades
+    // Enrich submissions with student batch, task info, and grades
     const enrichedSubmissions = effectiveSubmissions.map(sub => {
       const sId = sub.studentId?._id ? sub.studentId._id.toString() : sub.studentId?.toString();
+      const studentObj = hydrateStudent(sub.studentId);
       const studentBatchId = studentBatchMap[sId] || null;
       return {
         ...sub,
-        studentId: sub.studentId ? {
-          ...sub.studentId,
-          batchId: sub.studentId.batchId || studentBatchId
+        studentId: studentObj ? {
+          ...studentObj,
+          batchId: studentObj.batchId || studentBatchId
         } : null,
+        taskId: hydrateTask(sub.taskId),
         grade: gradeMap[sub._id.toString()] || null
       };
     });
@@ -459,12 +638,13 @@ const getMonitorDashboardData = async (req, res) => {
     // Enrich active attendances with student batch assignment
     const enrichedActiveAttendances = effectiveActiveAttendances.map(a => {
       const sId = a.studentId?._id ? a.studentId._id.toString() : a.studentId?.toString();
+      const studentObj = hydrateStudent(a.studentId);
       const studentBatchId = studentBatchMap[sId] || null;
       return {
         ...a,
-        studentId: a.studentId ? {
-          ...a.studentId,
-          batchId: a.studentId.batchId || studentBatchId
+        studentId: studentObj ? {
+          ...studentObj,
+          batchId: studentObj.batchId || studentBatchId
         } : null
       };
     });
@@ -472,12 +652,13 @@ const getMonitorDashboardData = async (req, res) => {
     // Enrich mock drive scores with student batch assignment
     const enrichedMockDriveScores = effectiveMockDriveScores.map(score => {
       const sId = score.studentId?._id ? score.studentId._id.toString() : score.studentId?.toString();
+      const studentObj = hydrateStudent(score.studentId);
       const studentBatchId = studentBatchMap[sId] || null;
       return {
         ...score,
-        studentId: score.studentId ? {
-          ...score.studentId,
-          batchId: score.studentId.batchId || studentBatchId
+        studentId: studentObj ? {
+          ...studentObj,
+          batchId: studentObj.batchId || studentBatchId
         } : null
       };
     });
@@ -485,27 +666,30 @@ const getMonitorDashboardData = async (req, res) => {
     // Enrich leaves with student batch assignment
     const enrichedLeaves = effectiveLeaves.map(l => {
       const sId = l.studentId?._id ? l.studentId._id.toString() : l.studentId?.toString();
+      const studentObj = hydrateStudent(l.studentId);
       const studentBatchId = studentBatchMap[sId] || null;
       return {
         ...l,
-        studentId: l.studentId ? {
-          ...l.studentId,
-          batchId: l.studentId.batchId || l.batch || studentBatchId
+        studentId: studentObj ? {
+          ...studentObj,
+          batchId: studentObj.batchId || l.batch || studentBatchId
         } : null
       };
     });
 
-    // Build student task/quiz/mock scores maps for efficient lookups
-    const studentTaskScores = {};
-    effectiveSubmissions.forEach(sub => {
-      if (sub.studentId) {
-        const sId = sub.studentId._id ? sub.studentId._id.toString() : sub.studentId.toString();
-        const marks = gradeMap[sub._id.toString()]?.marksObtained || 0;
-        studentTaskScores[sId] = (studentTaskScores[sId] || 0) + marks;
-      }
+    // Build full-DB per-student submission & score lookup map
+    const studentSubStatsMap = new Map();
+    (studentSubAgg || []).forEach(row => {
+      if (!row._id) return;
+      studentSubStatsMap.set(row._id.toString(), {
+        totalSubmissions: row.totalSubmissions || 0,
+        pendingCount: row.pendingCount || 0,
+        gradedCount: row.gradedCount || 0,
+        resubmitCount: row.resubmitCount || 0,
+        totalTaskScore: row.totalTaskScore || 0,
+        avgGrade: row.pctCount > 0 ? Math.round(row.pctSum / row.pctCount) : 0
+      });
     });
-
-    const studentQuizScores = {};
 
     const studentMockScores = {};
     effectiveMockDriveScores.forEach(score => {
@@ -515,33 +699,29 @@ const getMonitorDashboardData = async (req, res) => {
       }
     });
 
-    // Build student data with attendance stats
+    // Pre-index active student set in O(N)
+    const activeStudentSet = new Set();
+    effectiveActiveAttendances.forEach(a => {
+      const sId = (a.studentId?._id || a.studentId)?.toString();
+      if (sId) activeStudentSet.add(sId);
+    });
+
+    // Build student data with full-DB attendance & submission stats
     const studentData = effectiveStudents.map(student => {
       const sId = student._id.toString();
       const batchId = studentBatchMap[sId] || null;
       const att = attendanceMap[sId] || { totalSeconds: 0, daysPresentCount: 0 };
-      const isActive = effectiveActiveAttendances.some(a => 
-        a.studentId && a.studentId._id.toString() === sId
-      );
-      
-      // Calculate student's submissions and avg grade
-      const studentSubmissions = effectiveSubmissions.filter(s => 
-        s.studentId && s.studentId._id.toString() === sId
-      );
-      const gradedSubs = studentSubmissions.filter(s => s.status === 'graded');
-      let avgGrade = 0;
-      if (gradedSubs.length > 0) {
-        const totalMarksPercent = gradedSubs.reduce((acc, s) => {
-          const g = gradeMap[s._id.toString()];
-          if (g && s.taskId && s.taskId.maxMarks) {
-            return acc + (g.marksObtained / s.taskId.maxMarks) * 100;
-          }
-          return acc;
-        }, 0);
-        avgGrade = Math.round(totalMarksPercent / gradedSubs.length);
-      }
+      const isActive = activeStudentSet.has(sId);
+      const subStats = studentSubStatsMap.get(sId) || {
+        totalSubmissions: 0,
+        pendingCount: 0,
+        gradedCount: 0,
+        resubmitCount: 0,
+        totalTaskScore: 0,
+        avgGrade: 0
+      };
 
-      const totalTaskScore = studentTaskScores[sId] || 0;
+      const totalTaskScore = subStats.totalTaskScore;
       const totalMockDriveScore = studentMockScores[sId] || 0;
       const streakScore = (student.leetcodeStreak || 0) * 10;
       const overallScore = totalTaskScore + totalMockDriveScore + streakScore;
@@ -552,41 +732,55 @@ const getMonitorDashboardData = async (req, res) => {
         totalSeconds: att.totalSeconds,
         daysPresent: att.daysPresentCount,
         isActive,
-        totalSubmissions: studentSubmissions.length,
-        gradedCount: gradedSubs.length,
-        pendingCount: studentSubmissions.filter(s => s.status === 'submitted').length,
-        avgGrade,
+        totalSubmissions: subStats.totalSubmissions,
+        gradedCount: subStats.gradedCount,
+        pendingCount: subStats.pendingCount,
+        resubmitCount: subStats.resubmitCount,
+        avgGrade: subStats.avgGrade,
         totalTaskScore,
         totalMockDriveScore,
         overallScore
       };
     });
 
-    // Build batch summary data
-    const batchSummaries = effectiveBatches.map(batch => {
-      const batchStudents = studentData.filter(s => 
-        s.batchId && s.batchId.toString() === batch._id.toString()
-      );
-      const batchTasks = effectiveTasks.filter(t => 
-        t.batchId && t.batchId._id ? t.batchId._id.toString() === batch._id.toString() : t.batchId.toString() === batch._id.toString()
-      );
-      const batchSubmissions = effectiveSubmissions.filter(s =>
-        s.taskId && s.taskId.batchId && s.taskId.batchId.toString() === batch._id.toString()
-      );
-      const batchSubmissionCount = isRestrictedScope
-        ? batchSubmissions.length
-        : batchTasks.reduce((sum, t) => sum + (t.submissionCount || 0), 0);
-      const activeInBatch = batchStudents.filter(s => s.isActive).length;
+    const studentsByBatchMap = new Map();
+    studentData.forEach(s => {
+      const bId = s.batchId ? s.batchId.toString() : null;
+      if (!bId) return;
+      if (!studentsByBatchMap.has(bId)) studentsByBatchMap.set(bId, []);
+      studentsByBatchMap.get(bId).push(s);
+    });
 
-      // Average attendance of batch students
-      const avgAttendance = batchStudents.length > 0
-        ? Math.round(batchStudents.reduce((sum, s) => sum + s.daysPresent, 0) / batchStudents.length)
-        : 0;
-      
-      // Average grade of batch students  
-      const avgGrade = batchStudents.length > 0
-        ? Math.round(batchStudents.reduce((sum, s) => sum + s.avgGrade, 0) / batchStudents.length)
-        : 0;
+    const tasksByBatchMap = new Map();
+    effectiveTasks.forEach(t => {
+      const bId = (t.batchId?._id || t.batchId)?.toString();
+      if (!bId) return;
+      if (!tasksByBatchMap.has(bId)) tasksByBatchMap.set(bId, []);
+      tasksByBatchMap.get(bId).push(t);
+    });
+
+    // Build batch summary data from exact full-DB task & student stats
+    const batchSummaries = effectiveBatches.map(batch => {
+      const bIdStr = batch._id.toString();
+      const batchStudents = studentsByBatchMap.get(bIdStr) || [];
+      const batchTasks = tasksByBatchMap.get(bIdStr) || [];
+      const batchSubmissionCount = batchTasks.reduce((sum, t) => sum + (t.submissionCount || 0), 0);
+
+      let activeInBatch = 0;
+      let totalAtt = 0;
+      let totalGrade = 0;
+      let gradedStudentCount = 0;
+      for (const s of batchStudents) {
+        if (s.isActive) activeInBatch++;
+        totalAtt += s.daysPresent;
+        if ((s.gradedCount || 0) > 0 || (s.avgGrade || 0) > 0) {
+          totalGrade += s.avgGrade;
+          gradedStudentCount++;
+        }
+      }
+
+      const avgAttendance = batchStudents.length > 0 ? Math.round(totalAtt / batchStudents.length) : 0;
+      const avgGrade = gradedStudentCount > 0 ? Math.round(totalGrade / gradedStudentCount) : 0;
 
       return {
         ...batch,
@@ -622,10 +816,10 @@ const getMonitorDashboardData = async (req, res) => {
       }
     });
 
-    // Add today's submissions to timeline
-    const todayStr = new Date().toISOString().split('T')[0];
-    effectiveSubmissions.forEach(sub => {
-      if (sub.submittedAt && new Date(sub.submittedAt).toISOString().split('T')[0] === todayStr) {
+    // Add today's submissions (IST day) to timeline
+    const todayStr = getISTDateStr();
+    enrichedSubmissions.forEach(sub => {
+      if (sub.submittedAt && getISTDateStr(new Date(sub.submittedAt)) === todayStr) {
         activityTimeline.push({
           type: 'submission',
           studentName: sub.studentId?.name || 'Unknown',
@@ -653,20 +847,24 @@ const getMonitorDashboardData = async (req, res) => {
     let totalSubmissionsCount = 0;
     let totalPendingReviews = 0;
     let totalCompletedReviews = 0;
+    let totalResubmitReviews = 0;
 
     (subStatusAgg || []).forEach(item => {
       totalSubmissionsCount += (item.count || 0);
       if (item._id === 'submitted' || item._id === 'pending') totalPendingReviews += (item.count || 0);
       if (item._id === 'graded') totalCompletedReviews += (item.count || 0);
+      if (item._id === 'resubmit') totalResubmitReviews += (item.count || 0);
     });
 
     if (totalSubmissionsCount === 0 && effectiveSubmissions.length > 0) {
       totalSubmissionsCount = effectiveSubmissions.length;
-      totalPendingReviews = effectiveSubmissions.filter(s => s.status === 'submitted').length;
+      totalPendingReviews = effectiveSubmissions.filter(s => s.status === 'submitted' || s.status === 'pending').length;
       totalCompletedReviews = effectiveSubmissions.filter(s => s.status === 'graded').length;
+      totalResubmitReviews = effectiveSubmissions.filter(s => s.status === 'resubmit').length;
     }
-    const overallAvgGrade = studentData.length > 0
-      ? Math.round(studentData.reduce((sum, s) => sum + s.avgGrade, 0) / studentData.filter(s => s.avgGrade > 0).length) || 0
+    const gradedStudentList = studentData.filter(s => (s.gradedCount || 0) > 0 || (s.avgGrade || 0) > 0);
+    const overallAvgGrade = gradedStudentList.length > 0
+      ? Math.round(gradedStudentList.reduce((sum, s) => sum + s.avgGrade, 0) / gradedStudentList.length)
       : 0;
     const overallAvgAttendance = studentData.length > 0
       ? Math.round(studentData.reduce((sum, s) => sum + s.daysPresent, 0) / studentData.length)
@@ -691,12 +889,16 @@ const getMonitorDashboardData = async (req, res) => {
     });
     const avgMockDriveScore = mockPercentageCount > 0 ? Math.round(totalMockPercentage / mockPercentageCount) : 0;
 
-    const effectiveSyllabus = isRestrictedScope
+    const effectiveSyllabus = (isRestrictedScope
       ? (allSyllabus || []).filter(s => {
           const bId = s.batchId?._id ? s.batchId._id.toString() : s.batchId?.toString();
           return bId && allowedBatchIds.includes(bId);
         })
-      : (allSyllabus || []);
+      : (allSyllabus || [])
+    ).map(s => ({
+      ...s,
+      batchId: hydrateBatch(s.batchId)
+    }));
 
     const payload = {
       stats: {
@@ -708,12 +910,14 @@ const getMonitorDashboardData = async (req, res) => {
         totalSubmissions: totalSubmissionsCount || effectiveSubmissions.length,
         pendingReviews: totalPendingReviews,
         completedReviews: totalCompletedReviews,
+        resubmitReviews: totalResubmitReviews,
         avgAttendanceDays: overallAvgAttendance,
         avgPerformance: overallAvgGrade,
         avgMockDriveScore,
         topLeetcodeStreak,
         totalLeetcodeSolved
       },
+      serverTimestamp: new Date().toISOString(),
       panelName,
       isRestricted: isRestrictedScope,
       allowedBatchIds: isRestrictedScope ? allowedBatchIds : [],
@@ -732,21 +936,77 @@ const getMonitorDashboardData = async (req, res) => {
       syllabusTracks: effectiveSyllabus
     };
 
-    monitorCacheMap.set(cacheKey, { payload, timestamp: now });
+    monitorCacheMap.set(cacheKey, { payload, timestamp: Date.now() });
+    return payload;
+  })();
 
+  inFlightMonitorMap.set(cacheKey, buildPromise);
+  try {
+    return await buildPromise;
+  } finally {
+    inFlightMonitorMap.delete(cacheKey);
+  }
+};
+
+// Trigger silent background pre-warm for instant /verify dashboard open
+const prewarmMonitorDashboard = (rawPin = '') => {
+  const cleanPin = (rawPin || '').trim().toUpperCase();
+  const cacheKey = cleanPin || 'global';
+  const entry = monitorCacheMap.get(cacheKey);
+  if (entry && (Date.now() - entry.timestamp) < MONITOR_CACHE_TTL_MS) return;
+  buildMonitorPayload(cleanPin, cacheKey).catch(() => {});
+};
+
+// @desc    Get complete monitoring dashboard data
+// @route   GET /api/public/monitor
+// @access  Public (Requires Frontend Passcode / PIN)
+const getMonitorDashboardData = async (req, res) => {
+  try {
+    const now = Date.now();
+    const isFreshRequested = req.query.fresh === 'true';
+    const pin = (req.query.pin || req.headers['x-monitor-pin'] || '').trim().toUpperCase();
+    const cacheKey = pin || 'global';
+
+    if (!isFreshRequested && monitorCacheMap.has(cacheKey)) {
+      const entry = monitorCacheMap.get(cacheKey);
+      const age = entry ? (now - entry.timestamp) : Infinity;
+      if (age < MONITOR_CACHE_TTL_MS) {
+        return res.status(200).json(entry.payload);
+      }
+      if (age < MONITOR_STALE_TTL_MS) {
+        // Return stale snapshot immediately and refresh silently in background
+        buildMonitorPayload(pin, cacheKey).catch(() => {});
+        return res.status(200).json(entry.payload);
+      }
+    }
+
+    const payload = await buildMonitorPayload(pin, cacheKey);
     res.status(200).json(payload);
   } catch (error) {
-    console.error(error);
+    console.error('getMonitorDashboardData error:', error);
+    const pin = (req.query.pin || req.headers['x-monitor-pin'] || '').trim().toUpperCase();
+    const cacheKey = pin || 'global';
+    const staleEntry = monitorCacheMap.get(cacheKey);
+    if (staleEntry?.payload) {
+      return res.status(200).json(staleEntry.payload);
+    }
     res.status(500).json({ message: 'Server error fetching monitoring data.' });
   }
 };
+
+const allocatedResourcesCacheMap = new Map();
 
 // @desc    Get all allocated tasks, projects and leetcode problems (optionally scoped to a specific batch)
 // @route   GET /api/public/allocated-resources
 // @access  Public
 const getAllocatedResources = async (req, res) => {
+  const { batchId } = req.query;
+  const cacheKey = batchId ? String(batchId).trim() : 'all';
   try {
-    const { batchId } = req.query;
+    const cached = allocatedResourcesCacheMap.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp) < MONITOR_CACHE_TTL_MS) {
+      return res.status(200).json(cached.payload);
+    }
 
     const taskQuery = {
       $or: [
@@ -795,26 +1055,34 @@ const getAllocatedResources = async (req, res) => {
       }
     }
 
-    const [tasks, leetcodeProblems, allBatches] = await Promise.all([
+    const [tasksRaw, leetcodeRaw, allBatches] = await Promise.all([
       Task.find(taskQuery)
-        .populate('batchId', 'batchName panelName')
         .sort({ createdAt: -1 })
         .lean(),
       Leetcode.find(leetcodeQuery)
-        .populate('batchId', 'batchName panelName')
         .sort({ createdAt: -1 })
         .lean(),
       Batch.find().select('batchName panelName status').lean()
     ]);
 
-    res.status(200).json({
+    const batchMap = new Map(allBatches.map(b => [b._id.toString(), { _id: b._id, batchName: b.batchName, panelName: b.panelName }]));
+    const tasks = tasksRaw.map(t => ({ ...t, batchId: t.batchId ? (batchMap.get(t.batchId.toString()) || t.batchId) : null }));
+    const leetcodeProblems = leetcodeRaw.map(lp => ({ ...lp, batchId: lp.batchId ? (batchMap.get(lp.batchId.toString()) || lp.batchId) : null }));
+
+    const payload = {
       tasks,
       leetcodeProblems,
       batches: allBatches,
       selectedBatch: targetBatch || null
-    });
+    };
+    allocatedResourcesCacheMap.set(cacheKey, { payload, timestamp: Date.now() });
+    res.status(200).json(payload);
   } catch (error) {
     console.error(error);
+    const stale = allocatedResourcesCacheMap.get(cacheKey);
+    if (stale?.payload) {
+      return res.status(200).json(stale.payload);
+    }
     res.status(500).json({ message: 'Server error fetching allocated resources.' });
   }
 };
@@ -822,5 +1090,6 @@ const getAllocatedResources = async (req, res) => {
 module.exports = {
   verifyStudent,
   getMonitorDashboardData,
+  prewarmMonitorDashboard,
   getAllocatedResources
 };

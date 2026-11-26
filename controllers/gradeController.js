@@ -67,19 +67,19 @@ const addGrade = async (req, res) => {
       const percentage = maxMarks > 0 ? (marksObtained / maxMarks) * 100 : 0;
       
       const isProject = submission.taskId?.category === 'Project';
-      let baseXP = 150;
+      let baseXP = Math.round(maxMarks * 15);
       let baseCoins = maxMarks * 10;
 
       if (isProject) {
         const titleLower = (submission.taskId?.title || '').toLowerCase();
         if (titleLower.includes('final') || titleLower.includes('capstone')) {
-          baseXP = 5000;
+          baseXP = Math.max(5000, maxMarks * 15);
           baseCoins = Math.max(2500, maxMarks * 10);
         } else if (titleLower.includes('large') || maxMarks >= 100) {
-          baseXP = 1500;
+          baseXP = Math.max(1500, maxMarks * 15);
           baseCoins = Math.max(700, maxMarks * 10);
         } else {
-          baseXP = 500;
+          baseXP = Math.max(500, maxMarks * 15);
           baseCoins = Math.max(250, maxMarks * 10);
         }
       }
@@ -95,20 +95,29 @@ const addGrade = async (req, res) => {
 
       const targetCoins = isProject
         ? Math.round(baseCoins * multiplier)
-        : Math.round(marksObtained * 10);
+        : Math.round(finalMarks * 10);
+      const targetXP = isProject
+        ? Math.round(baseXP * multiplier)
+        : Math.round(finalMarks * 15);
       const alreadyAwarded = submission.coinsAwarded || 0;
+      const alreadyAwardedXP = submission.xpAwarded || 0;
       const coinsReward = Math.max(0, targetCoins - alreadyAwarded);
-      const pointsReward = Math.round(baseXP * multiplier);
+      const pointsReward = Math.max(0, targetXP - alreadyAwardedXP);
       
       const { awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges } = require('../utils/gamification');
       const actualCoins = coinsReward > 0
         ? awardCoinsWithCap(studentUser, coinsReward, `Grade: ${percentage.toFixed(0)}%`, true)
         : 0;
-      const actualXP = awardXPWithCap(studentUser, pointsReward, `Grade: ${percentage.toFixed(0)}%`, isProject);
+      const actualXP = pointsReward > 0
+        ? awardXPWithCap(studentUser, pointsReward, `Grade: ${percentage.toFixed(0)}%`, true)
+        : { actual: 0 };
       checkAndAwardBadges(studentUser);
       
       if (actualCoins > 0) {
         submission.coinsAwarded = alreadyAwarded + actualCoins;
+      }
+      if ((actualXP.actual || 0) > 0) {
+        submission.xpAwarded = alreadyAwardedXP + (actualXP.actual || 0);
       }
 
       savePromises.push(studentUser.save());
@@ -301,13 +310,13 @@ const autoEvaluateSubmissions = async (req, res) => {
       let marksObtained = task.maxMarks;
       let feedback = 'Full marks. Submitted on time.';
 
-      if (submissionDate > dueDate) {
-        const delayMs = submissionDate - dueDate;
-        const delayHours = Math.floor(delayMs / (1000 * 60 * 60));
-        if (delayHours > 0) {
-          marksObtained = Math.max(0, task.maxMarks - delayHours);
-          feedback = `Submitted late by ${delayHours} hour(s). Marks reduced accordingly.`;
-        }
+      const effectivePenalty = submission.latePenalty > 0
+        ? submission.latePenalty
+        : (submissionDate > dueDate ? Math.ceil((submissionDate - dueDate) / (1000 * 60 * 60)) : 0);
+
+      if (effectivePenalty > 0) {
+        marksObtained = Math.max(0, task.maxMarks - effectivePenalty);
+        feedback = `Submitted late (${effectivePenalty} mark(s) penalty). Marks & coins reduced accordingly.`;
       }
 
       gradesToCreate.push({
@@ -318,6 +327,7 @@ const autoEvaluateSubmissions = async (req, res) => {
       });
 
       let newCoinsAwarded = submission.coinsAwarded || 0;
+      let newXpAwarded = submission.xpAwarded || 0;
 
       // 3. Award Gamification Rewards in memory (saved once per student)
       try {
@@ -327,19 +337,19 @@ const autoEvaluateSubmissions = async (req, res) => {
           const percentage = maxMarks > 0 ? (marksObtained / maxMarks) * 100 : 0;
 
           const isProject = task.category === 'Project';
-          let baseXP = 150;
+          let baseXP = Math.round(maxMarks * 15);
           let baseCoins = maxMarks * 10;
 
           if (isProject) {
             const titleLower = (task.title || '').toLowerCase();
             if (titleLower.includes('final') || titleLower.includes('capstone')) {
-              baseXP = 5000;
+              baseXP = Math.max(5000, maxMarks * 15);
               baseCoins = Math.max(2500, maxMarks * 10);
             } else if (titleLower.includes('large') || maxMarks >= 100) {
-              baseXP = 1500;
+              baseXP = Math.max(1500, maxMarks * 15);
               baseCoins = Math.max(700, maxMarks * 10);
             } else {
-              baseXP = 500;
+              baseXP = Math.max(500, maxMarks * 15);
               baseCoins = Math.max(250, maxMarks * 10);
             }
           }
@@ -356,19 +366,28 @@ const autoEvaluateSubmissions = async (req, res) => {
           const targetCoins = isProject
             ? Math.round(baseCoins * multiplier)
             : Math.round(marksObtained * 10);
+          const targetXP = isProject
+            ? Math.round(baseXP * multiplier)
+            : Math.round(marksObtained * 15);
           const alreadyAwarded = submission.coinsAwarded || 0;
+          const alreadyAwardedXP = submission.xpAwarded || 0;
           const coinsReward = Math.max(0, targetCoins - alreadyAwarded);
-          const pointsReward = Math.round(baseXP * multiplier);
+          const pointsReward = Math.max(0, targetXP - alreadyAwardedXP);
 
           const actualCoins = coinsReward > 0
             ? awardCoinsWithCap(studentUser, coinsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, true)
             : 0;
-          const actualXP = awardXPWithCap(studentUser, pointsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, isProject);
+          const actualXP = pointsReward > 0
+            ? awardXPWithCap(studentUser, pointsReward, `Auto-Grade: ${percentage.toFixed(0)}%`, true)
+            : { actual: 0 };
           checkAndAwardBadges(studentUser);
           touchedStudents.add(studentUser._id.toString());
 
           if (actualCoins > 0) {
             newCoinsAwarded = alreadyAwarded + actualCoins;
+          }
+          if ((actualXP.actual || 0) > 0) {
+            newXpAwarded = alreadyAwardedXP + (actualXP.actual || 0);
           }
 
           if (actualCoins > 0 || (actualXP.actual || 0) > 0) {
@@ -388,7 +407,7 @@ const autoEvaluateSubmissions = async (req, res) => {
       submissionOps.push({
         updateOne: {
           filter: { _id: submission._id },
-          update: { $set: { status: 'graded', coinsAwarded: newCoinsAwarded } }
+          update: { $set: { status: 'graded', coinsAwarded: newCoinsAwarded, xpAwarded: newXpAwarded } }
         }
       });
 

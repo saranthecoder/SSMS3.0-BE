@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const cookieParser = require('cookie-parser');
+const zlib = require('zlib');
 const connectDB = require('./config/db');
 
 // Load env vars
@@ -56,6 +57,31 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+
+// Lightweight zero-dependency gzip compression for JSON/text payloads (> 1 KB)
+app.use((req, res, next) => {
+  const acceptEncoding = String(req.headers['accept-encoding'] || '');
+  if (!acceptEncoding.includes('gzip')) return next();
+
+  const origJson = res.json.bind(res);
+  res.json = (body) => {
+    if (res.headersSent) return origJson(body);
+    try {
+      const jsonStr = JSON.stringify(body);
+      if (!jsonStr || Buffer.byteLength(jsonStr, 'utf8') < 1024) {
+        return origJson(body);
+      }
+      const compressed = zlib.gzipSync(jsonStr, { level: 6 });
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.removeHeader('Content-Length');
+      return res.send(compressed);
+    } catch {
+      return origJson(body);
+    }
+  };
+  next();
+});
 app.use(cors({
   origin: (origin, callback) => callback(null, true),
   credentials: true,
