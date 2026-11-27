@@ -29,8 +29,15 @@ const triggerAutoWfhGrant = async (batchId, dateStr = getISTDateStr()) => {
     const effOnsiteMin = dw.onsiteMinHours || 2;
     const effOnsiteMax = dw.onsiteMaxHours || 10;
 
-    const enrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
-    const studentIds = enrollments.map(e => e.studentId);
+    const existingGrants = dw.restrictedToGranted
+      ? await CheckInAccess.find({ batchId, dateStr }).select('studentId').lean()
+      : [];
+    const enrollments = dw.restrictedToGranted
+      ? []
+      : await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
+    const studentIds = dw.restrictedToGranted
+      ? existingGrants.map(g => g.studentId)
+      : enrollments.map(e => e.studentId);
 
     // Mark DailyWorkload as wfhAllocated: true and autoWfhGranted: true
     dw.wfhAllocated = true;
@@ -106,8 +113,15 @@ const triggerAutoOnsiteCheckoutAndRevoke = async (batchId, dateStr = getISTDateS
     const dw = await DailyWorkload.findOne({ batchId, dateStr });
     if (!dw || !dw.autoOnsiteCheckoutEnabled) return false;
 
-    const enrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
-    const studentIds = enrollments.map(e => e.studentId);
+    const existingGrants = dw.restrictedToGranted
+      ? await CheckInAccess.find({ batchId, dateStr }).select('studentId').lean()
+      : [];
+    const enrollments = dw.restrictedToGranted
+      ? []
+      : await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
+    const studentIds = dw.restrictedToGranted
+      ? existingGrants.map(g => g.studentId)
+      : enrollments.map(e => e.studentId);
 
     // Mark DailyWorkload as autoOnsiteCheckoutDone: true
     dw.autoOnsiteCheckoutDone = true;
@@ -699,7 +713,8 @@ const saveDailyWorkload = async (req, res) => {
       autoWfhTime,
       autoOnsiteCheckoutEnabled,
       autoOnsiteCheckoutTime,
-      notes
+      notes,
+      saveOnly
     } = req.body;
 
     if (!batchId) {
@@ -741,6 +756,7 @@ const saveDailyWorkload = async (req, res) => {
           autoOnsiteCheckoutEnabled: effAutoOnsiteEnabled,
           autoOnsiteCheckoutTime: effAutoOnsiteTime,
           ...(effAutoOnsiteEnabled && currentISTTime < effAutoOnsiteTime ? { autoOnsiteCheckoutDone: false } : {}),
+          ...(saveOnly ? { restrictedToGranted: true } : {}),
           notes: notes || '',
           updatedBy: req.user._id
         }
@@ -757,8 +773,8 @@ const saveDailyWorkload = async (req, res) => {
       }
     });
 
-    // Check if auto-scheduled WFH should trigger immediately (if scheduled time already passed today)
-    if (autoWfhEnabled && currentISTTime >= (autoWfhTime || '19:00')) {
+    // When saveOnly is true, do NOT bulk-grant WFH to unselected students automatically
+    if (!saveOnly && autoWfhEnabled && currentISTTime >= (autoWfhTime || '19:00')) {
       await triggerAutoWfhGrant(batchId, dateStr);
     }
 
@@ -767,30 +783,34 @@ const saveDailyWorkload = async (req, res) => {
       await triggerAutoOnsiteCheckoutAndRevoke(batchId, dateStr);
     }
 
-    // Sync all approved students of this batch
-    const enrollments = await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean();
-    const studentIds = enrollments.map(e => e.studentId);
+    // Sync only already-granted students when saveOnly is true
+    const existingGrants = await CheckInAccess.find({ batchId, dateStr }).select('studentId').lean();
+    const grantedIds = existingGrants.map(g => g.studentId);
+    const studentIds = saveOnly
+      ? grantedIds
+      : (await Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean()).map(e => e.studentId);
 
-    // Update today's CheckInAccess records for this batch
-    await CheckInAccess.updateMany(
-      { batchId, dateStr, studentId: { $in: studentIds } },
-      {
-        $set: {
-          onsiteAllocated: Boolean(onsiteAllocated),
-          onsiteMinHours: effOnsiteMin,
-          onsiteMaxHours: effOnsiteMax,
-          wfhAllocated: Boolean(wfhAllocated),
-          wfhMinHours: effWfhMin,
-          wfhMaxHours: effWfhMax
+    // Update today's CheckInAccess records for granted students
+    if (grantedIds.length > 0) {
+      await CheckInAccess.updateMany(
+        { batchId, dateStr, studentId: { $in: grantedIds } },
+        {
+          $set: {
+            onsiteAllocated: Boolean(onsiteAllocated),
+            onsiteMinHours: effOnsiteMin,
+            onsiteMaxHours: effOnsiteMax,
+            wfhAllocated: Boolean(wfhAllocated),
+            wfhMinHours: effWfhMin,
+            wfhMaxHours: effWfhMax
+          }
         }
-      }
-    );
+      );
+    }
 
     // Update today's Attendance records and re-evaluate
-    const attendances = await Attendance.find({
-      studentId: { $in: studentIds },
-      dateStr
-    });
+    const attendances = studentIds.length > 0
+      ? await Attendance.find({ studentId: { $in: studentIds }, dateStr })
+      : [];
 
     for (const att of attendances) {
       att.onsiteAllocated = Boolean(onsiteAllocated || (att.onsiteDurationSeconds || 0) > 0);
@@ -817,9 +837,227 @@ const saveDailyWorkload = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: 'Daily workload policy updated and attendance re-evaluated successfully.',
+      message: saveOnly
+        ? 'Daily workload rules saved. Use Activate Daily Workload on selected students to grant access.'
+        : 'Daily workload policy updated and attendance re-evaluated successfully.',
       workload,
       updatedAttendancesCount: attendances.length
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Activate saved Daily Workload features (On-Site/WFH/Auto-Schedule) ONLY for selected students
+// @route   POST /api/checkin-access/activate-workload
+// @access  Private (Mentor/Admin)
+const activateDailyWorkload = async (req, res) => {
+  try {
+    const {
+      batchId,
+      studentIds,
+      onsiteAllocated,
+      onsiteMinHours,
+      onsiteMaxHours,
+      wfhAllocated,
+      wfhMinHours,
+      wfhMaxHours,
+      autoWfhEnabled,
+      autoWfhTime,
+      autoOnsiteCheckoutEnabled,
+      autoOnsiteCheckoutTime,
+      notes
+    } = req.body;
+
+    if (!batchId) {
+      return res.status(400).json({ message: 'batchId is required.' });
+    }
+    if (!Array.isArray(studentIds) || studentIds.length === 0) {
+      return res.status(400).json({ message: 'Please select at least one student to activate the Daily Workload.' });
+    }
+
+    const DailyWorkload = require('../models/DailyWorkload');
+    const Attendance = require('../models/Attendance');
+    const Batch = require('../models/Batch');
+    const { evaluateAttendanceRecord } = require('./attendanceController');
+
+    const dateStr = getISTDateStr();
+    const existingDw = await DailyWorkload.findOne({ batchId, dateStr }).lean();
+
+    const effOnsiteAllocated = onsiteAllocated !== undefined ? Boolean(onsiteAllocated) : Boolean(existingDw?.onsiteAllocated ?? true);
+    const effWfhAllocated = wfhAllocated !== undefined ? Boolean(wfhAllocated) : Boolean(existingDw?.wfhAllocated ?? true);
+
+    if (!effOnsiteAllocated && !effWfhAllocated) {
+      return res.status(400).json({ message: 'At least one mode (On-Site or WFH) must be enabled in Daily Workload Record.' });
+    }
+
+    const effOnsiteMin = Number(onsiteMinHours ?? existingDw?.onsiteMinHours ?? 4) || 4;
+    const effOnsiteMax = Number(onsiteMaxHours ?? existingDw?.onsiteMaxHours ?? 10) || 10;
+    const effWfhMin = Number(wfhMinHours ?? existingDw?.wfhMinHours ?? 4) || 4;
+    const effWfhMax = Number(wfhMaxHours ?? existingDw?.wfhMaxHours ?? 10) || 10;
+    const effAutoWfhEnabled = autoWfhEnabled !== undefined ? Boolean(autoWfhEnabled) : Boolean(existingDw?.autoWfhEnabled ?? true);
+    const effAutoWfhTime = autoWfhTime || existingDw?.autoWfhTime || '19:00';
+    const effAutoOnsiteEnabled = autoOnsiteCheckoutEnabled !== undefined ? Boolean(autoOnsiteCheckoutEnabled) : Boolean(existingDw?.autoOnsiteCheckoutEnabled ?? true);
+    const effAutoOnsiteTime = autoOnsiteCheckoutTime || existingDw?.autoOnsiteCheckoutTime || '17:00';
+    const currentISTTime = getISTTimeStr();
+
+    // Persist DailyWorkload benchmark & mark restrictedToGranted so auto-schedule only affects granted students
+    const workload = await DailyWorkload.findOneAndUpdate(
+      { batchId, dateStr },
+      {
+        $set: {
+          onsiteAllocated: effOnsiteAllocated,
+          onsiteMinHours: effOnsiteMin,
+          onsiteMaxHours: effOnsiteMax,
+          wfhAllocated: effWfhAllocated,
+          wfhMinHours: effWfhMin,
+          wfhMaxHours: effWfhMax,
+          autoWfhEnabled: effAutoWfhEnabled,
+          autoWfhTime: effAutoWfhTime,
+          autoOnsiteCheckoutEnabled: effAutoOnsiteEnabled,
+          autoOnsiteCheckoutTime: effAutoOnsiteTime,
+          ...(effAutoOnsiteEnabled && currentISTTime < effAutoOnsiteTime ? { autoOnsiteCheckoutDone: false } : {}),
+          restrictedToGranted: true,
+          notes: notes !== undefined ? notes : (existingDw?.notes || ''),
+          updatedBy: req.user._id
+        }
+      },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    await Batch.findByIdAndUpdate(batchId, {
+      $set: {
+        autoWfhEnabled: effAutoWfhEnabled,
+        autoWfhTime: effAutoWfhTime,
+        autoOnsiteCheckoutEnabled: effAutoOnsiteEnabled,
+        autoOnsiteCheckoutTime: effAutoOnsiteTime
+      }
+    });
+
+    // Check today's approved leaves for selected students
+    const approvedLeaves = await Leave.find({
+      studentId: { $in: studentIds },
+      status: 'approved',
+      $or: [
+        { startDate: dateStr },
+        { leaveType: 'multiple_days', startDate: { $lte: dateStr }, endDate: { $gte: dateStr } }
+      ]
+    }).lean();
+    const leaveStudentSet = new Set(approvedLeaves.map(l => l.studentId.toString()));
+
+    const preferWfhNow = !effOnsiteAllocated ||
+      (effWfhAllocated && ((effAutoWfhEnabled && currentISTTime >= effAutoWfhTime) || (effAutoOnsiteEnabled && currentISTTime >= effAutoOnsiteTime)));
+
+    const activatedIds = [];
+    let skippedLeaveCount = 0;
+
+    for (const rawId of studentIds) {
+      const sIdStr = rawId.toString();
+      const isLeave = leaveStudentSet.has(sIdStr);
+
+      if (isLeave && !effWfhAllocated) {
+        skippedLeaveCount += 1;
+        continue;
+      }
+
+      const studentOnsite = isLeave ? false : effOnsiteAllocated;
+      const studentWfh = effWfhAllocated;
+      const studentAccessType = (isLeave || preferWfhNow || !studentOnsite) ? 'wfh' : 'on-site';
+      const activeMin = studentAccessType === 'wfh' ? effWfhMin : effOnsiteMin;
+      const activeMax = studentAccessType === 'wfh' ? effWfhMax : effOnsiteMax;
+
+      await CheckInAccess.findOneAndUpdate(
+        { studentId: rawId, batchId, dateStr },
+        {
+          $set: {
+            accessType: studentAccessType,
+            grantedBy: req.user._id,
+            workHours: activeMin,
+            minHours: activeMin,
+            maxHours: activeMax,
+            onsiteAllocated: studentOnsite,
+            onsiteMinHours: effOnsiteMin,
+            onsiteMaxHours: effOnsiteMax,
+            wfhAllocated: studentWfh,
+            wfhMinHours: effWfhMin,
+            wfhMaxHours: effWfhMax
+          }
+        },
+        { upsert: true, returnDocument: 'after' }
+      );
+      activatedIds.push(rawId);
+    }
+
+    if (activatedIds.length === 0) {
+      return res.status(400).json({
+        message: 'All selected students are on approved leave today and WFH is not enabled in Daily Workload.'
+      });
+    }
+
+    // Sync Attendance records strictly for activated selected students
+    const attendances = await Attendance.find({ studentId: { $in: activatedIds }, dateStr });
+    for (const att of attendances) {
+      const isLeave = leaveStudentSet.has(att.studentId.toString());
+      const studentOnsite = isLeave ? false : effOnsiteAllocated;
+      const studentAccessType = (isLeave || preferWfhNow || !studentOnsite) ? 'wfh' : 'on-site';
+      const activeMin = studentAccessType === 'wfh' ? effWfhMin : effOnsiteMin;
+      const activeMax = studentAccessType === 'wfh' ? effWfhMax : effOnsiteMax;
+
+      if (att.isActive && att.accessType && att.accessType !== studentAccessType) {
+        const prevElapsed = att.lastCheckInTime
+          ? Math.max(0, Math.floor((Date.now() - new Date(att.lastCheckInTime).getTime()) / 1000))
+          : 0;
+        att.isActive = false;
+        att.checkOutTime = Date.now();
+        evaluateAttendanceRecord(att, prevElapsed);
+      }
+
+      att.accessType = studentAccessType;
+      att.workHours = activeMin;
+      att.minRequiredHours = activeMin;
+      att.maxValidHours = activeMax;
+      att.onsiteAllocated = Boolean(studentOnsite || (att.onsiteDurationSeconds || 0) > 0);
+      att.onsiteMinHours = effOnsiteMin;
+      att.onsiteMaxHours = effOnsiteMax;
+      att.wfhAllocated = Boolean(effWfhAllocated || (att.wfhDurationSeconds || 0) > 0);
+      att.wfhMinHours = effWfhMin;
+      att.wfhMaxHours = effWfhMax;
+      if (!att.isActive) {
+        evaluateAttendanceRecord(att, 0);
+      }
+      await att.save();
+    }
+
+    try {
+      const { emitToUser, emitToBatch } = require('../sockets/socketHandlers');
+      emitToBatch(batchId.toString(), 'daily-workload-updated', { batchId, dateStr, workload });
+      activatedIds.forEach(id => {
+        const isLeave = leaveStudentSet.has(id.toString());
+        const sType = (isLeave || preferWfhNow || !effOnsiteAllocated) ? 'wfh' : 'on-site';
+        emitToUser(id, 'checkin-access-updated', {
+          hasAccess: true,
+          accessType: sType,
+          workHours: sType === 'wfh' ? effWfhMin : effOnsiteMin,
+          minHours: sType === 'wfh' ? effWfhMin : effOnsiteMin,
+          maxHours: sType === 'wfh' ? effWfhMax : effOnsiteMax,
+          batchId
+        });
+      });
+    } catch (socketErr) {
+      console.warn('Socket emit error in activateDailyWorkload:', socketErr.message);
+    }
+
+    const msgParts = [`Daily Workload activated for ${activatedIds.length} selected student(s).`];
+    if (skippedLeaveCount > 0) {
+      msgParts.push(`${skippedLeaveCount} leave student(s) skipped (On-Site only).`);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: msgParts.join(' '),
+      activatedCount: activatedIds.length,
+      skippedLeaveCount,
+      workload
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -833,6 +1071,7 @@ module.exports = {
   getMyStatus,
   getDailyWorkload,
   saveDailyWorkload,
+  activateDailyWorkload,
   triggerAutoWfhGrant,
   triggerAutoOnsiteCheckoutAndRevoke,
   getISTTimeStr,

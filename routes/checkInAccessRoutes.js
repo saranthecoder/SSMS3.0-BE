@@ -6,7 +6,8 @@ const {
   getTodayAccess,
   getMyStatus,
   getDailyWorkload,
-  saveDailyWorkload
+  saveDailyWorkload,
+  activateDailyWorkload
 } = require('../controllers/checkInAccessController');
 const { protect, mentorOrAdmin } = require('../middleware/authMiddleware');
 
@@ -16,5 +17,6 @@ router.get('/today', protect, mentorOrAdmin, getTodayAccess);
 router.get('/my-status', protect, getMyStatus);
 router.get('/workload', protect, mentorOrAdmin, getDailyWorkload);
 router.post('/workload', protect, mentorOrAdmin, saveDailyWorkload);
+router.post('/activate-workload', protect, mentorOrAdmin, activateDailyWorkload);
 
 module.exports = router;
