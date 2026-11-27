@@ -1,13 +1,11 @@
 const CheckInAccess = require('../models/CheckInAccess');
 const Leave = require('../models/Leave');
-
-const getISTDateStr = (date = new Date()) => {
-  const istTime = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-  const year = istTime.getFullYear();
-  const month = String(istTime.getMonth() + 1).padStart(2, '0');
-  const day = String(istTime.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-};
+const {
+  getISTDateStr,
+  getPreviousDayISTDateStr,
+  getISTDayStartUTC,
+  evaluateBatchEligibility
+} = require('../utils/checkinEligibility');
 
 const getISTTimeStr = (date = new Date()) => {
   const istTime = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
@@ -421,7 +419,14 @@ const getTodayAccess = async (req, res) => {
 
     const DailyWorkload = require('../models/DailyWorkload');
     const Attendance = require('../models/Attendance');
-    const [grants, leaves, dailyWorkload] = await Promise.all([
+    const Enrollment = require('../models/Enrollment');
+    const Task = require('../models/Task');
+    const Submission = require('../models/Submission');
+
+    const yesterdayDateStr = getPreviousDayISTDateStr();
+    const todayStartIST = getISTDayStartUTC();
+
+    const [grants, leaves, dailyWorkload, batchEnrollments, prevTasks] = await Promise.all([
       CheckInAccess.find(query)
         .populate('studentId', 'name email rollNumber')
         .populate('grantedBy', 'name')
@@ -438,11 +443,54 @@ const getTodayAccess = async (req, res) => {
           }
         ]
       }).select('studentId reason leaveType startDate endDate').lean(),
-      batchId ? DailyWorkload.findOne({ batchId, dateStr }).lean() : null
+      batchId ? DailyWorkload.findOne({ batchId, dateStr }).lean() : null,
+      batchId ? Enrollment.find({ batchId, status: 'approved' }).select('studentId').lean() : Promise.resolve([]),
+      batchId
+        ? Task.find({
+            batchId,
+            $expr: {
+              $lt: [{ $ifNull: ['$scheduledAt', '$createdAt'] }, todayStartIST]
+            }
+          }).select('_id').lean()
+        : Promise.resolve([])
     ]);
 
     const sIds = grants.map(g => g.studentId?._id || g.studentId).filter(Boolean);
-    const rawAttendances = await Attendance.find({ studentId: { $in: sIds }, dateStr }).lean();
+    const enrolledIds = batchEnrollments.map(e => e.studentId).filter(Boolean);
+    const eligibilityStudentIdSet = new Set([
+      ...sIds.map(id => id.toString()),
+      ...enrolledIds.map(id => id.toString())
+    ]);
+    const eligibilityStudentIds = [...eligibilityStudentIdSet];
+    const prevTaskIds = prevTasks.map(t => t._id);
+
+    const [rawAttendances, prevTaskSubmissions, yesterdayAttendances] = await Promise.all([
+      Attendance.find({ studentId: { $in: sIds }, dateStr }).lean(),
+      batchId && eligibilityStudentIds.length > 0 && prevTaskIds.length > 0
+        ? Submission.find({
+            studentId: { $in: eligibilityStudentIds },
+            taskId: { $in: prevTaskIds },
+            status: { $in: ['submitted', 'graded'] }
+          }).select('studentId taskId status').lean()
+        : Promise.resolve([]),
+      batchId && eligibilityStudentIds.length > 0
+        ? Attendance.find({
+            studentId: { $in: eligibilityStudentIds },
+            dateStr: yesterdayDateStr
+          }).select('studentId status').lean()
+        : Promise.resolve([])
+    ]);
+
+    const { eligibilityByStudent, summary: eligibilityStats } = evaluateBatchEligibility({
+      studentIds: eligibilityStudentIds,
+      prevTaskIds,
+      submissions: prevTaskSubmissions,
+      yesterdayAttendances
+    });
+    const eligibilitySummary = {
+      ...eligibilityStats,
+      yesterdayDateStr
+    };
     const nowMs = Date.now();
     const attendances = rawAttendances.map(a => {
       if (a.isActive && a.lastCheckInTime) {
@@ -477,7 +525,14 @@ const getTodayAccess = async (req, res) => {
       };
     });
 
-    res.status(200).json({ grants: enrichedGrants, leaves, dailyWorkload, attendances });
+    res.status(200).json({
+      grants: enrichedGrants,
+      leaves,
+      dailyWorkload,
+      attendances,
+      eligibilityByStudent,
+      eligibilitySummary
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
