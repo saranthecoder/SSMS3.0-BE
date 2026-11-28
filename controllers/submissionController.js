@@ -6,6 +6,7 @@ const GamificationEvent = require('../models/GamificationEvent');
 const { awardCoinsWithCap, awardXPWithCap, checkAndAwardBadges } = require('../utils/gamification');
 const socketHandlers = require('../sockets/socketHandlers');
 const { invalidateStudentAnalyticsCache } = require('./analyticsController');
+const { validateTaskSubmissionPayload } = require('../utils/submissionValidation');
 
 // @desc    Submit a task
 // @route   POST /api/submissions
@@ -16,7 +17,23 @@ const submitTask = async (req, res) => {
 
     const task = await Task.findById(taskId);
     if (!task) {
-      return res.status(404).json({ message: 'Task not found' });
+      return res.status(404).json({ message: 'Task not submitted: Task could not be found.' });
+    }
+
+    const validation = validateTaskSubmissionPayload({
+      submissionType,
+      textContent,
+      linkUrl,
+      fileUrl,
+      task,
+      submittedLinks
+    });
+    if (!validation.valid) {
+      return res.status(400).json({
+        message: validation.message,
+        lineCount: validation.lineCount,
+        maxLines: validation.maxLines
+      });
     }
 
     const submissionExists = await Submission.findOne({
@@ -120,7 +137,7 @@ const submitTask = async (req, res) => {
           taskMarks
         });
       } else {
-        return res.status(400).json({ message: 'Task already submitted. Cannot resubmit.' });
+        return res.status(400).json({ message: 'Task not submitted: You have already submitted this task and resubmission has not been requested.' });
       }
     }
 
