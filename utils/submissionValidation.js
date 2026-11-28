@@ -1,4 +1,60 @@
 const MAX_TEXT_SUBMISSION_LINES = 100;
+const MAX_URL_LENGTH = 2048;
+
+/**
+ * Validates that a link submission value is strictly a single HTTP/HTTPS URL (no code, spaces, or plain text).
+ */
+const validateSubmissionUrl = (rawUrl, fieldLabel = 'Submission Link') => {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+    return {
+      valid: false,
+      message: `Task not submitted: "${fieldLabel}" is required. Please enter a valid URL starting with https:// or http://.`
+    };
+  }
+
+  const trimmed = rawUrl.trim();
+  if (trimmed.length > MAX_URL_LENGTH) {
+    return {
+      valid: false,
+      message: `Task not submitted: "${fieldLabel}" is too long. Please submit only a valid link (max ${MAX_URL_LENGTH} characters).`
+    };
+  }
+
+  if (/\s/.test(trimmed) || /[{}<>`]/.test(trimmed)) {
+    return {
+      valid: false,
+      message: `Task not submitted: Only a valid URL link is allowed in "${fieldLabel}" (code, spaces, or multi-line text cannot be submitted as a link).`
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return {
+      valid: false,
+      message: `Task not submitted: "${fieldLabel}" is not a valid URL. Enter a full link starting with https:// or http:// (do not paste code).`
+    };
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return {
+      valid: false,
+      message: `Task not submitted: "${fieldLabel}" must use https:// or http://.`
+    };
+  }
+
+  const host = (parsed.hostname || '').toLowerCase();
+  const isValidDomain = /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/.test(host) || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host);
+  if (!isValidDomain) {
+    return {
+      valid: false,
+      message: `Task not submitted: "${fieldLabel}" must point to a valid domain URL (e.g. https://github.com/... or https://drive.google.com/...).`
+    };
+  }
+
+  return { valid: true, url: trimmed };
+};
 
 /**
  * Counts logical text/code lines in a plain-text or rich-text (ReactQuill HTML) submission.
@@ -41,6 +97,8 @@ const validateTaskSubmissionPayload = ({
   submissionType,
   textContent,
   linkUrl,
+  githubLink,
+  liveLink,
   fileUrl,
   task,
   submittedLinks
@@ -50,13 +108,17 @@ const validateTaskSubmissionPayload = ({
   if (requiredLinks.length > 0) {
     const provided = Array.isArray(submittedLinks) ? submittedLinks : [];
     for (const reqLink of requiredLinks) {
-      if (!reqLink.isMandatory) continue;
       const match = provided.find(sl => sl && sl.label === reqLink.label);
-      if (!match || !String(match.url || '').trim()) {
+      const val = String(match?.url || '').trim();
+      if (reqLink.isMandatory && !val) {
         return {
           valid: false,
           message: `Task not submitted: "${reqLink.label}" link is mandatory. Please provide a valid URL before submitting.`
         };
+      }
+      if (val) {
+        const urlCheck = validateSubmissionUrl(val, reqLink.label);
+        if (!urlCheck.valid) return urlCheck;
       }
     }
     return { valid: true };
@@ -85,11 +147,19 @@ const validateTaskSubmissionPayload = ({
     return { valid: true, lineCount, maxLines: MAX_TEXT_SUBMISSION_LINES };
   }
 
-  if (effectiveType === 'link' && !String(linkUrl || '').trim()) {
-    return {
-      valid: false,
-      message: 'Task not submitted: Please enter a valid Project Link / GitHub URL before submitting.'
-    };
+  if (effectiveType === 'link') {
+    const urlCheck = validateSubmissionUrl(linkUrl, 'Project Link / GitHub URL');
+    if (!urlCheck.valid) return urlCheck;
+  }
+
+  if (githubLink && String(githubLink).trim()) {
+    const ghCheck = validateSubmissionUrl(githubLink, 'GitHub Link');
+    if (!ghCheck.valid) return ghCheck;
+  }
+
+  if (liveLink && String(liveLink).trim()) {
+    const liveCheck = validateSubmissionUrl(liveLink, 'Live Link');
+    if (!liveCheck.valid) return liveCheck;
   }
 
   if (effectiveType === 'file' && !String(fileUrl || '').trim()) {
@@ -105,5 +175,6 @@ const validateTaskSubmissionPayload = ({
 module.exports = {
   MAX_TEXT_SUBMISSION_LINES,
   countSubmissionTextLines,
+  validateSubmissionUrl,
   validateTaskSubmissionPayload
 };

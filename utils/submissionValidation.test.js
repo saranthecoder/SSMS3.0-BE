@@ -3,6 +3,7 @@ const assert = require('node:assert');
 const {
   MAX_TEXT_SUBMISSION_LINES,
   countSubmissionTextLines,
+  validateSubmissionUrl,
   validateTaskSubmissionPayload
 } = require('./submissionValidation');
 
@@ -52,4 +53,31 @@ test('validateTaskSubmissionPayload enforces exact 100-line limit on text submis
     task: {}
   });
   assert.strictEqual(linkRes.valid, true);
+});
+
+test('validateSubmissionUrl & payload validation allow only valid URLs and reject pasted code or non-URLs', () => {
+  assert.strictEqual(validateSubmissionUrl('https://github.com/user/project-repo').valid, true);
+  assert.strictEqual(validateSubmissionUrl('https://docs.google.com/document/d/abc_123/edit?usp=sharing').valid, true);
+
+  // Code pasted directly or prefixed with https:// must be rejected
+  assert.strictEqual(validateSubmissionUrl('public class Main { public static void main(String[] args) {} }').valid, false);
+  assert.strictEqual(validateSubmissionUrl('https:// public class Main {\n  int a = 5;\n}').valid, false);
+  assert.strictEqual(validateSubmissionUrl('https://System.out.println("hi"){return;}').valid, false);
+  assert.strictEqual(validateSubmissionUrl('https://localhost_or_code').valid, false);
+  assert.strictEqual(validateSubmissionUrl('javascript:alert(1)').valid, false);
+  assert.strictEqual(validateSubmissionUrl('github.com/user/repo').valid, false);
+
+  const rejectedLinkPayload = validateTaskSubmissionPayload({
+    submissionType: 'link',
+    linkUrl: 'https:// import java.util.*; class Solution {}',
+    task: {}
+  });
+  assert.strictEqual(rejectedLinkPayload.valid, false);
+  assert.match(rejectedLinkPayload.message, /valid URL link/i);
+
+  const rejectedRequiredLink = validateTaskSubmissionPayload({
+    task: { requiredLinks: [{ label: 'GitHub Repo', isMandatory: true }] },
+    submittedLinks: [{ label: 'GitHub Repo', url: 'int main() { return 0; }' }]
+  });
+  assert.strictEqual(rejectedRequiredLink.valid, false);
 });

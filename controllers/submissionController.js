@@ -24,6 +24,8 @@ const submitTask = async (req, res) => {
       submissionType,
       textContent,
       linkUrl,
+      githubLink,
+      liveLink,
       fileUrl,
       task,
       submittedLinks
